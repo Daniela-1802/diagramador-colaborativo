@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: diagramador
+      POSTGRES_PASSWORD: diagramador123
+      POSTGRES_DB: diagramador_colaborativo
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://diagramador:diagramador123@db:5432/diagramador_colaborativo
+      JWT_SECRET: secreto-dev-cambiar-en-produccion
+      PORT: 3000
+    volumes:
+      - ./backend/prisma:/app/prisma
+    depends_on:
+      - db
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:

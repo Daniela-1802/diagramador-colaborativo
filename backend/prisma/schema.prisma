@@ -1,0 +1,102 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Usuario {
+  id             String          @id @default(uuid())
+  nombre         String
+  email          String          @unique
+  contrasenaHash String
+  createdAt      DateTime        @default(now())
+  colaboraciones Colaboracion[]
+  registros      RegistroSesion[]
+  comandos       ComandoVoz[]
+}
+
+model Diagrama {
+  id               String            @id @default(uuid())
+  titulo           String
+  tipo             TipoDiagrama
+  fechaCreacion    DateTime          @default(now())
+  fechaModificacion DateTime         @updatedAt
+  colaboraciones   Colaboracion[]
+  elementos        ElementoDiagrama[]
+}
+
+enum TipoDiagrama {
+  CLASES
+  ENTIDAD_RELACION
+}
+
+model Colaboracion {
+  id           String    @id @default(uuid())
+  rol          RolColaborador
+  fechaInvitacion DateTime @default(now())
+  usuario      Usuario   @relation(fields: [usuarioId], references: [id])
+  usuarioId    String
+  diagrama     Diagrama  @relation(fields: [diagramaId], references: [id])
+  diagramaId   String
+
+  @@unique([usuarioId, diagramaId])
+}
+
+enum RolColaborador {
+  PROPIETARIO
+  COLABORADOR
+  VISUALIZADOR
+}
+
+model ElementoDiagrama {
+  id         String         @id @default(uuid())
+  nombre     String
+  tipo       String
+  diagrama   Diagrama       @relation(fields: [diagramaId], references: [id])
+  diagramaId String
+  atributos  Atributo[]
+  relacionesOrigen   RelacionUML[] @relation("Origen")
+  relacionesDestino  RelacionUML[] @relation("Destino")
+}
+
+model Atributo {
+  id                  String          @id @default(uuid())
+  nombre              String
+  tipoDato            String
+  visibilidad         String?
+  elementoDiagrama    ElementoDiagrama @relation(fields: [elementoDiagramaId], references: [id])
+  elementoDiagramaId  String
+}
+
+model RelacionUML {
+  id                    String          @id @default(uuid())
+  tipo                  String
+  multiplicidadOrigen    String?
+  multiplicidadDestino   String?
+  origen                ElementoDiagrama @relation("Origen", fields: [origenId], references: [id])
+  origenId              String
+  destino               ElementoDiagrama @relation("Destino", fields: [destinoId], references: [id])
+  destinoId             String
+}
+
+model RegistroSesion {
+  id        String   @id @default(uuid())
+  accion    String
+  marcaTiempo DateTime @default(now())
+  usuario   Usuario  @relation(fields: [usuarioId], references: [id])
+  usuarioId String
+}
+
+model ComandoVoz {
+  id                String   @id @default(uuid())
+  textoOriginal     String
+  accionInterpretada String
+  exito             Boolean  @default(false)
+  marcaTiempo       DateTime @default(now())
+  usuario           Usuario  @relation(fields: [usuarioId], references: [id])
+  usuarioId         String
+}
