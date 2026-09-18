@@ -53,12 +53,14 @@ enum RolColaborador {
 }
 
 model ElementoDiagrama {
-  id         String         @id @default(uuid())
-  nombre     String
-  tipo       String
-  diagrama   Diagrama       @relation(fields: [diagramaId], references: [id])
-  diagramaId String
-  atributos  Atributo[]
+  id          String         @id @default(uuid())
+  nombre      String
+  tipo        String
+  posicionX   Float          @default(0)
+  posicionY   Float          @default(0)
+  diagrama    Diagrama       @relation(fields: [diagramaId], references: [id])
+  diagramaId  String
+  atributos   Atributo[]
   relacionesOrigen   RelacionUML[] @relation("Origen")
   relacionesDestino  RelacionUML[] @relation("Destino")
 }

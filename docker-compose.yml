@@ -22,6 +22,8 @@ services:
       DATABASE_URL: postgresql://diagramador:diagramador123@db:5432/diagramador_colaborativo
       JWT_SECRET: secreto-dev-cambiar-en-produccion
       PORT: 3000
+    env_file: 
+      - ./backend/.env
     volumes:
       - ./backend/prisma:/app/prisma
     depends_on:
@@ -32,6 +34,13 @@ services:
     restart: unless-stopped
     ports:
       - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:3000
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
     depends_on:
       - backend
 
