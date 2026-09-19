@@ -46,6 +46,7 @@ export function configurarSocket(io: Server) {
         tipo: elemento.tipo,
         posicionX: elemento.posicionX,
         posicionY: elemento.posicionY,
+        atributos: [],
       });
 
       return elemento;
@@ -84,12 +85,26 @@ export function configurarSocket(io: Server) {
 
       if (!elemento) return null;
 
-      await prisma.elementoDiagrama.delete({ where: { id: elemento.id } });
+      const relaciones = await prisma.relacionUML.findMany({
+        where: { OR: [{ origenId: elemento.id }, { destinoId: elemento.id }] },
+        select: { id: true },
+      });
+      await prisma.$transaction([
+        prisma.relacionUML.deleteMany({
+          where: { OR: [{ origenId: elemento.id }, { destinoId: elemento.id }] },
+        }),
+        prisma.elementoDiagrama.delete({ where: { id: elemento.id } }),
+      ]);
       await prisma.registroSesion.create({
         data: {
           usuarioId,
           accion: `Eliminó elemento ${elemento.nombre}`,
         },
+      });
+      relaciones.forEach((relacion) => {
+        io.to(`diagrama:${diagramaId}`).emit("relacion:eliminada", {
+          relacionId: relacion.id,
+        });
       });
       io.to(`diagrama:${diagramaId}`).emit("elemento:eliminado", {
         elementoId: elemento.id,
@@ -188,10 +203,33 @@ export function configurarSocket(io: Server) {
             tipo: true,
             posicionX: true,
             posicionY: true,
+            atributos: {
+              select: {
+                id: true,
+                nombre: true,
+                tipoDato: true,
+                visibilidad: true,
+              },
+            },
           },
         });
 
-        socket.emit("diagrama:estado", { elementos });
+        const relaciones = await prisma.relacionUML.findMany({
+          where: {
+            origen: { diagramaId },
+            destino: { diagramaId },
+          },
+          select: {
+            id: true,
+            origenId: true,
+            destinoId: true,
+            tipo: true,
+            multiplicidadOrigen: true,
+            multiplicidadDestino: true,
+          },
+        });
+
+        socket.emit("diagrama:estado", { elementos, relaciones });
         console.log(`[Socket] ${usuarioId} se unió a diagrama:${diagramaId}`);
       } catch (err) {
         console.error("[Socket] Error en diagrama:unirse:", err);
@@ -228,6 +266,117 @@ export function configurarSocket(io: Server) {
       } catch (err) {
         console.error("[Socket] Error en elemento:crear:", err);
         socket.emit("error", { mensaje: "Error al crear elemento" });
+      }
+    });
+
+    socket.on("atributo:crear", async (payload: {
+      diagramaId: string;
+      elementoId: string;
+      nombre: string;
+      tipoDato: string;
+      visibilidad: string;
+    }) => {
+      try {
+        const { diagramaId, elementoId, nombre, tipoDato, visibilidad } = payload;
+        const usuarioId = socket.data.usuarioId as string | undefined;
+        const socketDiagramaId = socket.data.diagramaId as string | undefined;
+
+        if (!usuarioId || !socketDiagramaId) {
+          socket.emit("error", { mensaje: "Debes unirte a un diagrama primero" });
+          return;
+        }
+        if (socketDiagramaId !== diagramaId) {
+          socket.emit("error", { mensaje: "No tienes acceso a este diagrama" });
+          return;
+        }
+        if (!nombre?.trim() || !tipoDato?.trim()) {
+          socket.emit("error", { mensaje: "El nombre y tipo de dato son requeridos" });
+          return;
+        }
+        if (!["+", "-", "#"].includes(visibilidad)) {
+          socket.emit("error", { mensaje: "La visibilidad no es válida" });
+          return;
+        }
+
+        const elemento = await prisma.elementoDiagrama.findFirst({
+          where: { id: elementoId, diagramaId },
+        });
+        if (!elemento) {
+          socket.emit("error", { mensaje: "El elemento no pertenece al diagrama" });
+          return;
+        }
+
+        const atributo = await prisma.atributo.create({
+          data: {
+            nombre: nombre.trim(),
+            tipoDato: tipoDato.trim(),
+            visibilidad,
+            elementoDiagramaId: elementoId,
+          },
+          select: {
+            id: true,
+            nombre: true,
+            tipoDato: true,
+            visibilidad: true,
+          },
+        });
+        await prisma.registroSesion.create({
+          data: {
+            usuarioId,
+            accion: `Creó atributo "${atributo.nombre}" en elemento ${elemento.nombre}`,
+          },
+        });
+        io.to(`diagrama:${diagramaId}`).emit("atributo:creado", {
+          id: atributo.id,
+          elementoId,
+          nombre: atributo.nombre,
+          tipoDato: atributo.tipoDato,
+          visibilidad: atributo.visibilidad,
+        });
+      } catch (err) {
+        console.error("[Socket] Error en atributo:crear:", err);
+        socket.emit("error", { mensaje: "Error al crear atributo" });
+      }
+    });
+
+    socket.on("atributo:eliminar", async (payload: { diagramaId: string; atributoId: string }) => {
+      try {
+        const { diagramaId, atributoId } = payload;
+        const usuarioId = socket.data.usuarioId as string | undefined;
+        const socketDiagramaId = socket.data.diagramaId as string | undefined;
+
+        if (!usuarioId || !socketDiagramaId) {
+          socket.emit("error", { mensaje: "Debes unirte a un diagrama primero" });
+          return;
+        }
+        if (socketDiagramaId !== diagramaId) {
+          socket.emit("error", { mensaje: "No tienes acceso a este diagrama" });
+          return;
+        }
+
+        const atributo = await prisma.atributo.findFirst({
+          where: { id: atributoId, elementoDiagrama: { diagramaId } },
+          select: { id: true, nombre: true, elementoDiagramaId: true },
+        });
+        if (!atributo) {
+          socket.emit("error", { mensaje: "No se encontró el atributo" });
+          return;
+        }
+
+        await prisma.atributo.delete({ where: { id: atributoId } });
+        await prisma.registroSesion.create({
+          data: {
+            usuarioId,
+            accion: `Eliminó atributo "${atributo.nombre}"`,
+          },
+        });
+        io.to(`diagrama:${diagramaId}`).emit("atributo:eliminado", {
+          atributoId: atributo.id,
+          elementoId: atributo.elementoDiagramaId,
+        });
+      } catch (err) {
+        console.error("[Socket] Error en atributo:eliminar:", err);
+        socket.emit("error", { mensaje: "Error al eliminar atributo" });
       }
     });
 
@@ -314,6 +463,170 @@ export function configurarSocket(io: Server) {
       } catch (err) {
         console.error("[Socket] Error en elemento:renombrar:", err);
         socket.emit("error", { mensaje: "Error al renombrar elemento" });
+      }
+    });
+
+    socket.on("relacion:crear", async (payload: {
+      diagramaId: string;
+      origenId: string;
+      destinoId: string;
+      tipo: string;
+    }) => {
+      try {
+        const { diagramaId, origenId, destinoId } = payload;
+        const usuarioId = socket.data.usuarioId as string | undefined;
+        const socketDiagramaId = socket.data.diagramaId as string | undefined;
+
+        if (!usuarioId || !socketDiagramaId) {
+          socket.emit("error", { mensaje: "Debes unirte a un diagrama primero" });
+          return;
+        }
+        if (socketDiagramaId !== diagramaId) {
+          socket.emit("error", { mensaje: "No tienes acceso a este diagrama" });
+          return;
+        }
+
+        const [origen, destino] = await Promise.all([
+          prisma.elementoDiagrama.findFirst({ where: { id: origenId, diagramaId } }),
+          prisma.elementoDiagrama.findFirst({ where: { id: destinoId, diagramaId } }),
+        ]);
+        if (!origen || !destino) {
+          socket.emit("error", { mensaje: "Los elementos deben pertenecer al diagrama" });
+          return;
+        }
+
+        const existente = await prisma.relacionUML.findFirst({
+          where: {
+            OR: [
+              { origenId, destinoId },
+              { origenId: destinoId, destinoId: origenId },
+            ],
+          },
+        });
+        if (existente) {
+          socket.emit("error", { mensaje: "Ya existe una relación entre esos elementos" });
+          return;
+        }
+
+        const relacion = await prisma.relacionUML.create({
+          data: {
+            tipo: "ASOCIACION",
+            multiplicidadOrigen: "1..*",
+            multiplicidadDestino: "1..*",
+            origenId,
+            destinoId,
+          },
+          select: {
+            id: true,
+            origenId: true,
+            destinoId: true,
+            tipo: true,
+            multiplicidadOrigen: true,
+            multiplicidadDestino: true,
+          },
+        });
+        await prisma.registroSesion.create({
+          data: { usuarioId, accion: `Creó relación ${origen.nombre} -> ${destino.nombre}` },
+        });
+        io.to(`diagrama:${diagramaId}`).emit("relacion:creada", relacion);
+      } catch (err) {
+        console.error("[Socket] Error en relacion:crear:", err);
+        socket.emit("error", { mensaje: "Error al crear relación" });
+      }
+    });
+
+    socket.on("relacion:eliminar", async (payload: { diagramaId: string; relacionId: string }) => {
+      try {
+        const { diagramaId, relacionId } = payload;
+        const usuarioId = socket.data.usuarioId as string | undefined;
+        const socketDiagramaId = socket.data.diagramaId as string | undefined;
+
+        if (!usuarioId || !socketDiagramaId) {
+          socket.emit("error", { mensaje: "Debes unirte a un diagrama primero" });
+          return;
+        }
+        if (socketDiagramaId !== diagramaId) {
+          socket.emit("error", { mensaje: "No tienes acceso a este diagrama" });
+          return;
+        }
+
+        const relacion = await prisma.relacionUML.findFirst({
+          where: { id: relacionId, origen: { diagramaId }, destino: { diagramaId } },
+        });
+        if (!relacion) {
+          socket.emit("error", { mensaje: "No se encontró la relación" });
+          return;
+        }
+
+        await prisma.relacionUML.delete({ where: { id: relacionId } });
+        await prisma.registroSesion.create({
+          data: { usuarioId, accion: `Eliminó relación ${relacionId}` },
+        });
+        io.to(`diagrama:${diagramaId}`).emit("relacion:eliminada", { relacionId });
+      } catch (err) {
+        console.error("[Socket] Error en relacion:eliminar:", err);
+        socket.emit("error", { mensaje: "Error al eliminar relación" });
+      }
+    });
+
+    socket.on("relacion:actualizar", async (payload: {
+      diagramaId: string;
+      relacionId: string;
+      tipo: string;
+      multiplicidadOrigen: string;
+      multiplicidadDestino: string;
+    }) => {
+      try {
+        const { diagramaId, relacionId, tipo, multiplicidadOrigen, multiplicidadDestino } = payload;
+        const usuarioId = socket.data.usuarioId as string | undefined;
+        const socketDiagramaId = socket.data.diagramaId as string | undefined;
+
+        if (!usuarioId || !socketDiagramaId) {
+          socket.emit("error", { mensaje: "Debes unirte a un diagrama primero" });
+          return;
+        }
+        if (socketDiagramaId !== diagramaId) {
+          socket.emit("error", { mensaje: "No tienes acceso a este diagrama" });
+          return;
+        }
+
+        const relacion = await prisma.relacionUML.findFirst({
+          where: {
+            id: relacionId,
+            origen: { diagramaId },
+            destino: { diagramaId },
+          },
+        });
+        if (!relacion) {
+          socket.emit("error", { mensaje: "No se encontró la relación" });
+          return;
+        }
+
+        const actualizada = await prisma.relacionUML.update({
+          where: { id: relacionId },
+          data: { tipo, multiplicidadOrigen, multiplicidadDestino },
+          select: {
+            id: true,
+            tipo: true,
+            multiplicidadOrigen: true,
+            multiplicidadDestino: true,
+          },
+        });
+        await prisma.registroSesion.create({
+          data: {
+            usuarioId,
+            accion: `Actualizó relación a ${tipo} (${multiplicidadOrigen}→${multiplicidadDestino})`,
+          },
+        });
+        io.to(`diagrama:${diagramaId}`).emit("relacion:actualizada", {
+          relacionId: actualizada.id,
+          tipo: actualizada.tipo,
+          multiplicidadOrigen: actualizada.multiplicidadOrigen,
+          multiplicidadDestino: actualizada.multiplicidadDestino,
+        });
+      } catch (err) {
+        console.error("[Socket] Error en relacion:actualizar:", err);
+        socket.emit("error", { mensaje: "Error al actualizar relación" });
       }
     });
 

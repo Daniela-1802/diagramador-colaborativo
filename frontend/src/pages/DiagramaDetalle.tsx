@@ -24,8 +24,15 @@ interface DiagramaData {
     tipo: string;
     posicionX: number;
     posicionY: number;
-    atributos: { nombre: string; tipoDato: string; visibilidad: string | null }[];
+    atributos: Atributo[];
   }[];
+}
+
+interface Atributo {
+  id: string;
+  nombre: string;
+  tipoDato: string;
+  visibilidad: string | null;
 }
 
 interface Props {
@@ -60,6 +67,13 @@ interface WindowWithSpeechRecognition extends Window {
   webkitSpeechRecognition?: new () => SpeechRecognitionLike;
 }
 
+interface RelacionSeleccionada {
+  id: string;
+  tipo: string;
+  multiplicidadOrigen: string;
+  multiplicidadDestino: string;
+}
+
 export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) {
   const [diagrama, setDiagrama] = useState<DiagramaData | null>(null);
   const [colaboradores, setColaboradores] = useState<Colaborador[]>([]);
@@ -73,6 +87,15 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   const [escuchando, setEscuchando] = useState(false);
   const [soportaVoz, setSoportaVoz] = useState(false);
   const [errorComando, setErrorComando] = useState("");
+  const [mostrarModalRelacion, setMostrarModalRelacion] = useState(false);
+  const [relacionSeleccionada, setRelacionSeleccionada] = useState<RelacionSeleccionada | null>(null);
+  const [mostrarModalAtributos, setMostrarModalAtributos] = useState(false);
+  const [nodoSeleccionado, setNodoSeleccionado] = useState<string | null>(null);
+  const [nombreNodo, setNombreNodo] = useState("");
+  const [atributosNodo, setAtributosNodo] = useState<Atributo[]>([]);
+  const [nombreAtributo, setNombreAtributo] = useState("");
+  const [tipoDatoAtributo, setTipoDatoAtributo] = useState("");
+  const [visibilidadAtributo, setVisibilidadAtributo] = useState("+");
 
   const diagramContainerRef = useRef<HTMLDivElement>(null);
   const diagramInstanceRef = useRef<go.Diagram | null>(null);
@@ -109,7 +132,17 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   // ─── useEffect A: Socket ───────────────────────────────────────────
   // Independiente de GoJS. Registra handlers y conecta el socket.
   useEffect(() => {
-    const onEstado = (data: { elementos: { id: string; nombre: string; tipo: string; posicionX: number; posicionY: number }[] }) => {
+    const onEstado = (data: {
+      elementos: { id: string; nombre: string; tipo: string; posicionX: number; posicionY: number; atributos: Atributo[] }[];
+      relaciones?: {
+        id: string;
+        origenId: string;
+        destinoId: string;
+        tipo: string;
+        multiplicidadOrigen: string | null;
+        multiplicidadDestino: string | null;
+      }[];
+    }) => {
       console.log("[onEstado] LLEGÓ estado con", data.elementos.length, "elementos");
       setUnidoAlDiagrama(true);
       let intentos = 0;
@@ -132,8 +165,22 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
             nombre: el.nombre,
             tipo: el.tipo,
             loc: go.Point.stringify(new go.Point(el.posicionX, el.posicionY)),
+            atributos: el.atributos || [],
           });
           nodePositionsRef.current.set(el.id, { x: el.posicionX, y: el.posicionY });
+        });
+        const model = diagram.model as go.GraphLinksModel;
+        data.relaciones?.forEach((relation) => {
+          if (model.findLinkDataForKey(relation.id)) return;
+          model.addLinkData({
+            key: relation.id,
+            origenId: relation.origenId,
+            destinoId: relation.destinoId,
+            tipo: relation.tipo,
+            multiplicidadOrigen: relation.multiplicidadOrigen,
+            multiplicidadDestino: relation.multiplicidadDestino,
+            multiplicidad: `${relation.multiplicidadOrigen || ""} → ${relation.multiplicidadDestino || ""}`,
+          });
         });
         diagram.commitTransaction("cargar estado");
       };
@@ -160,6 +207,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           nombre: data.nombre,
           tipo: data.tipo,
           loc: go.Point.stringify(new go.Point(data.posicionX, data.posicionY)),
+          atributos: [],
         });
         nodePositionsRef.current.set(data.id, { x: data.posicionX, y: data.posicionY });
         diagram.commitTransaction("agregar elemento");
@@ -182,11 +230,13 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     const onEliminado = (data: { elementoId: string }) => {
       const diagram = diagramInstanceRef.current;
       if (!diagram) return;
-      const model = diagram.model;
+      const model = diagram.model as go.GraphLinksModel;
       const nodeData = model.findNodeDataForKey(data.elementoId);
-      if (!nodeData) return;
       model.startTransaction("eliminar elemento remoto");
-      model.removeNodeData(nodeData);
+      model.linkDataArray
+        .filter((linkData) => linkData.origenId === data.elementoId || linkData.destinoId === data.elementoId)
+        .forEach((linkData) => model.removeLinkData(linkData));
+      if (nodeData) model.removeNodeData(nodeData);
       model.commitTransaction("eliminar elemento remoto");
       nodePositionsRef.current.delete(data.elementoId);
     };
@@ -199,6 +249,43 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
       diagram.model.startTransaction("actualizar elemento remoto");
       diagram.model.setDataProperty(nodeData, "nombre", data.nuevoNombre);
       diagram.model.commitTransaction("actualizar elemento remoto");
+    };
+
+    const onAtributoCreado = (data: {
+      id: string;
+      elementoId: string;
+      nombre: string;
+      tipoDato: string;
+      visibilidad: string | null;
+    }) => {
+      const diagram = diagramInstanceRef.current;
+      if (!diagram) return;
+      const nodeData = diagram.model.findNodeDataForKey(data.elementoId);
+      if (!nodeData) return;
+      const atributos = (nodeData.atributos || []) as Atributo[];
+      if (atributos.some((atributo) => atributo.id === data.id)) return;
+      diagram.model.startTransaction("crear atributo remoto");
+      diagram.model.setDataProperty(nodeData, "atributos", [...atributos, data]);
+      diagram.model.commitTransaction("crear atributo remoto");
+      setAtributosNodo((actuales) =>
+        actuales.some((atributo) => atributo.id === data.id) ? actuales : [...actuales, data]
+      );
+    };
+
+    const onAtributoEliminado = (data: { atributoId: string; elementoId: string }) => {
+      const diagram = diagramInstanceRef.current;
+      if (!diagram) return;
+      const nodeData = diagram.model.findNodeDataForKey(data.elementoId);
+      if (!nodeData) return;
+      const atributos = (nodeData.atributos || []) as Atributo[];
+      diagram.model.startTransaction("eliminar atributo remoto");
+      diagram.model.setDataProperty(
+        nodeData,
+        "atributos",
+        atributos.filter((atributo) => atributo.id !== data.atributoId)
+      );
+      diagram.model.commitTransaction("eliminar atributo remoto");
+      setAtributosNodo((actuales) => actuales.filter((atributo) => atributo.id !== data.atributoId));
     };
 
     const onRelacionCreada = (data: {
@@ -217,13 +304,44 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
       model.startTransaction("crear relación remota");
       model.addLinkData({
         key: data.id,
-        from: data.origenId,
-        to: data.destinoId,
+        origenId: data.origenId,
+        destinoId: data.destinoId,
         multiplicidadOrigen: data.multiplicidadOrigen,
         multiplicidadDestino: data.multiplicidadDestino,
+        multiplicidad: `${data.multiplicidadOrigen || ""} → ${data.multiplicidadDestino || ""}`,
         tipo: data.tipo,
       });
       model.commitTransaction("crear relación remota");
+    };
+
+    const onRelacionActualizada = (data: {
+      relacionId: string;
+      tipo: string;
+      multiplicidadOrigen: string | null;
+      multiplicidadDestino: string | null;
+    }) => {
+      const diagram = diagramInstanceRef.current;
+      if (!diagram) return;
+      const model = diagram.model as go.GraphLinksModel;
+      const linkData = model.findLinkDataForKey(data.relacionId);
+      if (!linkData) return;
+      model.startTransaction("actualizar relación remota");
+      model.setDataProperty(linkData, "tipo", data.tipo);
+      model.setDataProperty(linkData, "multiplicidadOrigen", data.multiplicidadOrigen);
+      model.setDataProperty(linkData, "multiplicidadDestino", data.multiplicidadDestino);
+      model.setDataProperty(linkData, "multiplicidad", `${data.multiplicidadOrigen || ""} → ${data.multiplicidadDestino || ""}`);
+      model.commitTransaction("actualizar relación remota");
+    };
+
+    const onRelacionEliminada = (data: { relacionId: string }) => {
+      const diagram = diagramInstanceRef.current;
+      if (!diagram) return;
+      const model = diagram.model as go.GraphLinksModel;
+      const linkData = model.findLinkDataForKey(data.relacionId);
+      if (!linkData) return;
+      model.startTransaction("eliminar relación remota");
+      model.removeLinkData(linkData);
+      model.commitTransaction("eliminar relación remota");
     };
 
     const onError = (data: { mensaje: string }) => {
@@ -241,7 +359,11 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     socket.on("elemento:movido", onMovido);
     socket.on("elemento:eliminado", onEliminado);
     socket.on("elemento:actualizado", onActualizado);
+    socket.on("atributo:creado", onAtributoCreado);
+    socket.on("atributo:eliminado", onAtributoEliminado);
     socket.on("relacion:creada", onRelacionCreada);
+    socket.on("relacion:eliminada", onRelacionEliminada);
+    socket.on("relacion:actualizada", onRelacionActualizada);
     socket.on("error", onError);
     socket.on("connect", onConnect);
 
@@ -258,7 +380,11 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
       socket.off("elemento:movido", onMovido);
       socket.off("elemento:eliminado", onEliminado);
       socket.off("elemento:actualizado", onActualizado);
+      socket.off("atributo:creado", onAtributoCreado);
+      socket.off("atributo:eliminado", onAtributoEliminado);
       socket.off("relacion:creada", onRelacionCreada);
+      socket.off("relacion:eliminada", onRelacionEliminada);
+      socket.off("relacion:actualizada", onRelacionActualizada);
       socket.off("error", onError);
       socket.off("connect", onConnect);
     };
@@ -282,21 +408,32 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
 
     const diagram = new go.Diagram(diagramContainerRef.current, {
       "undoManager.isEnabled": true,
-      layout: $(go.GridLayout, { wrappingColumn: 3, spacing: new go.Size(30, 30) }),
+      allowMove: true,
+      allowDragOut: false,
+      "draggingTool.isEnabled": true,
+      "draggingTool.dragsLink": false,
+      "draggingTool.dragsTree": false,
+      "linkingTool.isEnabled": true,
+      "linkingTool.direction": go.LinkingTool.ForwardsOnly,
+      "linkingTool.isUnconnectedLinkValid": false,
     });
+
+    diagram.linkSelectionAdornmentTemplate = $(go.Adornment);
+    diagram.nodeSelectionAdornmentTemplate = $(go.Adornment);
 
     diagram.nodeTemplate = $(
       go.Node,
       "Auto",
+      { movable: true, selectable: true },
       new go.Binding("position", "loc", go.Point.parse).makeTwoWay(
         go.Point.stringify
       ),
       $(go.Shape, "RoundedRectangle", {
+        name: "BODY",
         fill: "white",
         stroke: "#1a1a2e",
         strokeWidth: 2,
         width: 140,
-        height: 80,
       }),
       $(
         go.Panel,
@@ -312,47 +449,155 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           },
           new go.Binding("text", "nombre")
         ),
+        $(go.Shape, "LineH", { width: 132, stroke: "#1a1a2e", strokeWidth: 1 }),
         $(
-          go.TextBlock,
-          {
-            alignment: go.Spot.Center,
-            font: "10px system-ui, sans-serif",
-            stroke: "#888",
-            margin: 2,
-          },
-          new go.Binding("text", "tipo")
+          go.Panel,
+          "Vertical",
+          { defaultAlignment: go.Spot.Left, itemTemplate: $(
+            go.Panel,
+            "Horizontal",
+            $(
+              go.TextBlock,
+              { font: "11px system-ui, sans-serif", stroke: "#333", margin: new go.Margin(2, 4) },
+              new go.Binding("text", "", (atributo: Atributo) =>
+                `${atributo.visibilidad || "+"} ${atributo.nombre}: ${atributo.tipoDato}`
+              )
+            )
+          ) },
+          new go.Binding("itemArray", "atributos")
         )
-      )
+      ),
+      $(go.Shape, "Circle", {
+        alignment: go.Spot.Right,
+        width: 14,
+        height: 14,
+        fill: "#4361ee",
+        stroke: "white",
+        strokeWidth: 2,
+        portId: "right",
+        fromLinkable: true,
+        fromLinkableSelfNode: false,
+        fromLinkableDuplicates: false,
+        toLinkable: true,
+        toLinkableSelfNode: false,
+        toLinkableDuplicates: false,
+        cursor: "pointer",
+        fromSpot: go.Spot.Right,
+        toSpot: go.Spot.Right,
+      }),
+      $(go.Shape, "Circle", {
+        alignment: go.Spot.Left,
+        width: 14,
+        height: 14,
+        fill: "#4361ee",
+        stroke: "white",
+        strokeWidth: 2,
+        portId: "left",
+        fromLinkable: true,
+        fromLinkableSelfNode: false,
+        fromLinkableDuplicates: false,
+        toLinkable: true,
+        toLinkableSelfNode: false,
+        toLinkableDuplicates: false,
+        cursor: "pointer",
+        fromSpot: go.Spot.Left,
+        toSpot: go.Spot.Left,
+      })
     );
 
-    diagram.linkTemplate = $(
+    diagram.toolManager.linkingTool.portGravity = 50;
+    diagram.toolManager.linkingTool.isEnabled = true;
+    diagram.toolManager.linkingTool.direction = go.LinkingTool.ForwardsOnly;
+    diagram.allowMove = true;
+    diagram.allowDragOut = false;
+    diagram.toolManager.draggingTool.isEnabled = true;
+    diagram.toolManager.draggingTool.dragsLink = false;
+
+    diagram.linkTemplateMap.add("ASOCIACION", $(
       go.Link,
-      { routing: go.Link.AvoidsNodes, corner: 8, relinkableFrom: false, relinkableTo: false },
-      $(go.Shape, { stroke: "#1a1a2e", strokeWidth: 1.5 }),
-      $(go.Shape, { toArrow: "Standard", fill: "#1a1a2e", stroke: null }),
-      $(
-        go.Panel,
-        "Auto",
-        { segmentFraction: 0.2 },
-        $(go.Shape, "RoundedRectangle", { fill: "white", stroke: null }),
-        $(go.TextBlock, { margin: 2, font: "10px system-ui, sans-serif", stroke: "#1a1a2e" },
-          new go.Binding("text", "multiplicidadOrigen", (value) => value || ""))
-      ),
-      $(
-        go.Panel,
-        "Auto",
-        { segmentFraction: 0.8 },
-        $(go.Shape, "RoundedRectangle", { fill: "white", stroke: null }),
-        $(go.TextBlock, { margin: 2, font: "10px system-ui, sans-serif", stroke: "#1a1a2e" },
-          new go.Binding("text", "multiplicidadDestino", (value) => value || ""))
-      )
-    );
+      { routing: go.Link.Orthogonal, corner: 5 },
+      $(go.Shape, { strokeWidth: 2, stroke: "#1a1a2e", fill: null }),
+      $(go.Shape, { toArrow: "Standard", fill: "white", stroke: "#1a1a2e" }),
+      $(go.TextBlock,
+        { segmentOffset: new go.Point(0, -10), font: "11px sans-serif", stroke: "#555", background: null },
+        new go.Binding("text", "multiplicidad"))
+    ));
+
+    diagram.linkTemplateMap.add("HERENCIA", $(
+      go.Link,
+      { routing: go.Link.Orthogonal, corner: 5 },
+      $(go.Shape, { strokeWidth: 2, stroke: "#1a1a2e", fill: null }),
+      $(go.Shape, { toArrow: "Triangle", fill: "white", stroke: "#1a1a2e" })
+    ));
+
+    diagram.linkTemplateMap.add("COMPOSICION", $(
+      go.Link,
+      { routing: go.Link.Orthogonal, corner: 5 },
+      $(go.Shape, { strokeWidth: 2, stroke: "#1a1a2e", fill: null }),
+      $(go.Shape, { toArrow: "Diamond", fill: "#1a1a2e", stroke: "#1a1a2e" }),
+      $(go.TextBlock,
+        { segmentOffset: new go.Point(0, -10), font: "11px sans-serif", stroke: "#555", background: null },
+        new go.Binding("text", "multiplicidad"))
+    ));
+
+    diagram.linkTemplateMap.add("AGREGACION", $(
+      go.Link,
+      { routing: go.Link.Orthogonal, corner: 5 },
+      $(go.Shape, { strokeWidth: 2, stroke: "#1a1a2e", fill: null }),
+      $(go.Shape, { toArrow: "Diamond", fill: "white", stroke: "#1a1a2e" }),
+      $(go.TextBlock,
+        { segmentOffset: new go.Point(0, -10), font: "11px sans-serif", stroke: "#555", background: null },
+        new go.Binding("text", "multiplicidad"))
+    ));
 
     diagram.model = new go.GraphLinksModel({
       nodeKeyProperty: "key",
+      linkKeyProperty: "key",
+      linkFromKeyProperty: "origenId",
+      linkToKeyProperty: "destinoId",
+      linkCategoryProperty: "tipo",
     });
 
     diagramInstanceRef.current = diagram;
+
+    diagram.addDiagramListener("LinkDrawn", (event) => {
+      const link = event.subject as go.Link;
+      const origenId = link.data.origenId as string | undefined;
+      const destinoId = link.data.destinoId as string | undefined;
+      if (!origenId || !destinoId) return;
+      const model = diagram.model as go.GraphLinksModel;
+      model.setDataProperty(link.data, "tipo", "ASOCIACION");
+      model.setDataProperty(link.data, "multiplicidadOrigen", "1..*");
+      model.setDataProperty(link.data, "multiplicidadDestino", "1..*");
+      model.setDataProperty(link.data, "multiplicidad", "1..* → 1..*");
+      socket.emit("relacion:crear", {
+        diagramaId,
+        origenId,
+        destinoId,
+        tipo: "ASOCIACION",
+      });
+      (diagram.model as go.GraphLinksModel).removeLinkData(link.data);
+    });
+
+    diagram.addDiagramListener("ObjectSingleClicked", (event) => {
+      const part = event.subject.part;
+      if (part instanceof go.Link) {
+        setRelacionSeleccionada({
+          id: part.data.key,
+          tipo: part.data.tipo || "ASOCIACION",
+          multiplicidadOrigen: part.data.multiplicidadOrigen || "1..*",
+          multiplicidadDestino: part.data.multiplicidadDestino || "1..*",
+        });
+        setMostrarModalRelacion(true);
+        return;
+      }
+      if (part instanceof go.Node) {
+        setNodoSeleccionado(part.data.key);
+        setNombreNodo(part.data.nombre);
+        setAtributosNodo(part.data.atributos || []);
+        setMostrarModalAtributos(true);
+      }
+    });
 
     const handleMouseUp = () => {
       diagram.nodes.each((node) => {
@@ -397,7 +642,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   const agregarClase = useCallback(() => {
     const nombre = prompt("Nombre de la clase:");
     if (!nombre || !nombre.trim()) return;
-
+        // No-op placeholder for future diagram configurations
     socket.emit("elemento:crear", {
       diagramaId,
       nombre: nombre.trim(),
@@ -419,6 +664,40 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   const enviarComandoTexto = (e: React.FormEvent) => {
     e.preventDefault();
     enviarComando(textoComando);
+  };
+
+  const guardarRelacion = () => {
+    if (!relacionSeleccionada) return;
+    socket.emit("relacion:actualizar", {
+      diagramaId,
+      relacionId: relacionSeleccionada.id,
+      tipo: relacionSeleccionada.tipo,
+      multiplicidadOrigen: relacionSeleccionada.multiplicidadOrigen,
+      multiplicidadDestino: relacionSeleccionada.multiplicidadDestino,
+    });
+    setMostrarModalRelacion(false);
+    setRelacionSeleccionada(null);
+  };
+
+  const agregarAtributo = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!nodoSeleccionado || !nombreAtributo.trim() || !tipoDatoAtributo.trim()) return;
+    socket.emit("atributo:crear", {
+      diagramaId,
+      elementoId: nodoSeleccionado,
+      nombre: nombreAtributo.trim(),
+      tipoDato: tipoDatoAtributo.trim(),
+      visibilidad: visibilidadAtributo,
+    });
+    setNombreAtributo("");
+    setTipoDatoAtributo("");
+    setVisibilidadAtributo("+");
+  };
+
+  const cerrarModalAtributos = () => {
+    setMostrarModalAtributos(false);
+    setNodoSeleccionado(null);
+    setAtributosNodo([]);
   };
 
   const iniciarEscucha = () => {
@@ -622,6 +901,140 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           </div>
         </div>
       )}
+
+      {mostrarModalAtributos && nodoSeleccionado && (
+        <div style={styles.overlay} onClick={cerrarModalAtributos}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <h2 style={styles.modalTitulo}>Atributos de {nombreNodo}</h2>
+            <div style={styles.listaAtributos}>
+              {atributosNodo.map((atributo) => (
+                <div key={atributo.id} style={styles.atributoItem}>
+                  <span>{atributo.visibilidad || "+"} {atributo.nombre}: {atributo.tipoDato}</span>
+                  <button
+                    type="button"
+                    style={styles.botonEliminarAtributo}
+                    onClick={() => socket.emit("atributo:eliminar", { diagramaId, atributoId: atributo.id })}
+                  >
+                    Eliminar
+                  </button>
+                </div>
+              ))}
+              {atributosNodo.length === 0 && <p style={styles.sinAtributos}>No hay atributos.</p>}
+            </div>
+            <form onSubmit={agregarAtributo}>
+              <label style={styles.label}>Nombre</label>
+              <input
+                style={styles.input}
+                value={nombreAtributo}
+                onChange={(e) => setNombreAtributo(e.target.value)}
+                required
+              />
+              <label style={styles.label}>Tipo de dato</label>
+              <input
+                style={styles.input}
+                placeholder="string, int, boolean, Date..."
+                value={tipoDatoAtributo}
+                onChange={(e) => setTipoDatoAtributo(e.target.value)}
+                required
+              />
+              <label style={styles.label}>Visibilidad</label>
+              <select
+                style={styles.input}
+                value={visibilidadAtributo}
+                onChange={(e) => setVisibilidadAtributo(e.target.value)}
+              >
+                <option value="+">+ (público)</option>
+                <option value="-">- (privado)</option>
+                <option value="#"># (protegido)</option>
+              </select>
+              <div style={styles.botones}>
+                <button type="button" style={styles.botonCancelar} onClick={cerrarModalAtributos}>
+                  Cerrar
+                </button>
+                <button type="submit" style={styles.botonCrear}>Agregar</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {mostrarModalRelacion && relacionSeleccionada && (
+        <div style={styles.overlay} onClick={() => setMostrarModalRelacion(false)}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <h2 style={styles.modalTitulo}>Editar Relación</h2>
+            <label style={styles.label}>Tipo</label>
+            <select
+              style={styles.input}
+              value={relacionSeleccionada.tipo}
+              onChange={(e) => setRelacionSeleccionada({ ...relacionSeleccionada, tipo: e.target.value })}
+            >
+              <option value="ASOCIACION">ASOCIACION</option>
+              <option value="HERENCIA">HERENCIA</option>
+              <option value="COMPOSICION">COMPOSICION</option>
+              <option value="AGREGACION">AGREGACION</option>
+            </select>
+
+            <label style={styles.label}>Multiplicidad Origen</label>
+            <select
+              style={styles.input}
+              value={relacionSeleccionada.multiplicidadOrigen}
+              onChange={(e) => setRelacionSeleccionada({ ...relacionSeleccionada, multiplicidadOrigen: e.target.value })}
+            >
+              <option value="1">1</option>
+              <option value="*">*</option>
+              <option value="0..1">0..1</option>
+              <option value="1..*">1..*</option>
+              <option value="0..*">0..*</option>
+              <option value="2..5">2..5</option>
+            </select>
+
+            <label style={styles.label}>Multiplicidad Destino</label>
+            <select
+              style={styles.input}
+              value={relacionSeleccionada.multiplicidadDestino}
+              onChange={(e) => setRelacionSeleccionada({ ...relacionSeleccionada, multiplicidadDestino: e.target.value })}
+            >
+              <option value="1">1</option>
+              <option value="*">*</option>
+              <option value="0..1">0..1</option>
+              <option value="1..*">1..*</option>
+              <option value="0..*">0..*</option>
+              <option value="2..5">2..5</option>
+            </select>
+
+            <div style={styles.botones}>
+              <button
+                type="button"
+                style={styles.botonEliminarRelacion}
+                onClick={() => {
+                  if (!window.confirm("¿Eliminar esta relación?")) return;
+                  socket.emit("relacion:eliminar", {
+                    diagramaId,
+                    relacionId: relacionSeleccionada.id,
+                  });
+                  setMostrarModalRelacion(false);
+                  setRelacionSeleccionada(null);
+                }}
+              >
+                Eliminar relación
+              </button>
+              <button
+                type="button"
+                style={styles.botonCancelar}
+                onClick={() => {
+                  setMostrarModalRelacion(false);
+                  setRelacionSeleccionada(null);
+                }}
+              >
+                Cancelar
+              </button>
+              <button type="button" style={styles.botonCrear} onClick={guardarRelacion}>
+                Guardar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -684,10 +1097,25 @@ const styles: Record<string, React.CSSProperties> = {
   },
   errorModal: { color: "#e63946", fontSize: "0.85rem", marginBottom: "0.75rem" },
   exito: { color: "#2e7d32", fontSize: "0.85rem", marginBottom: "0.75rem" },
+  listaAtributos: { marginBottom: "1rem", maxHeight: "180px", overflowY: "auto" },
+  atributoItem: {
+    display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem",
+    padding: "0.5rem", borderBottom: "1px solid #eee", fontSize: "0.9rem",
+  },
+  botonEliminarAtributo: {
+    padding: "0.3rem 0.5rem", backgroundColor: "#e63946", color: "white",
+    border: "none", borderRadius: "4px", cursor: "pointer", fontSize: "0.75rem",
+  },
+  sinAtributos: { color: "#888", fontSize: "0.85rem", margin: "0 0 0.75rem" },
   botones: { display: "flex", justifyContent: "flex-end", gap: "0.75rem", marginTop: "0.5rem" },
   botonCancelar: {
     padding: "0.6rem 1rem", backgroundColor: "transparent", color: "#666",
     border: "1px solid #ddd", borderRadius: "4px", cursor: "pointer",
+  },
+  botonEliminarRelacion: {
+    padding: "0.6rem 1rem", backgroundColor: "#e63946", color: "white",
+    border: "none", borderRadius: "4px", cursor: "pointer", fontWeight: 600,
+    marginRight: "auto",
   },
   botonCrear: {
     padding: "0.6rem 1.25rem", backgroundColor: "#4361ee", color: "white",
