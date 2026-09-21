@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { Component, ErrorInfo, ReactNode, useState, useEffect } from "react";
 
 interface Diagrama {
   id: string;
@@ -6,6 +6,34 @@ interface Diagrama {
   tipo: string;
   fechaModificacion: string;
   colaboraciones: { rol: string; usuario: { id: string; nombre: string } }[];
+}
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+}
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false };
+
+  static getDerivedStateFromError(): ErrorBoundaryState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("Error al renderizar la lista de diagramas", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return <p style={styles.vacio}>No se pudo cargar la lista de diagramas.</p>;
+    }
+
+    return this.props.children;
+  }
 }
 
 interface Props {
@@ -56,7 +84,8 @@ export default function Panel({ usuario, token, onLogout, onAbrirDiagrama }: Pro
     }
 
     const nuevo = await res.json();
-    setDiagramas((prev) => [nuevo, ...prev]);
+    await cargarDiagramas();
+    onAbrirDiagrama(nuevo.id);
     setMostrarModal(false);
     setTitulo("");
     setTipo("clases");
@@ -87,24 +116,61 @@ export default function Panel({ usuario, token, onLogout, onAbrirDiagrama }: Pro
         {diagramas.length === 0 ? (
           <p style={styles.vacio}>No tienes diagramas aún. Crea uno para comenzar.</p>
         ) : (
-          <div style={styles.lista}>
-            {diagramas.map((d) => (
-              <div key={d.id} style={styles.tarjeta} onClick={() => onAbrirDiagrama(d.id)}>
-                <div style={styles.tarjetaHeader}>
-                  <span style={styles.tipoBadge}>
-                    {d.tipo === "CLASES" ? "Clases" : "Entidad-Relación"}
-                  </span>
-                  <span style={styles.fecha}>
-                    {new Date(d.fechaModificacion).toLocaleDateString("es-PE")}
-                  </span>
-                </div>
-                <h3 style={styles.tarjetaTitulo}>{d.titulo}</h3>
-                <p style={styles.tarjetaColabs}>
-                  {d.colaboraciones.map((c) => c.usuario.nombre).join(", ")}
-                </p>
-              </div>
-            ))}
-          </div>
+          <ErrorBoundary>
+            <div style={styles.lista}>
+              {diagramas.map((d) => {
+                const soyPropietario = (d.colaboraciones || []).some(
+                  (c) => c?.usuario?.id === usuario.id && c?.rol === "PROPIETARIO"
+                );
+
+                return (
+                  <div key={d.id} style={styles.tarjeta} onClick={() => onAbrirDiagrama(d.id)}>
+                    <div style={styles.tarjetaHeader}>
+                      <span style={styles.tipoBadge}>
+                        {d.tipo === "CLASES" ? "Clases" : "Entidad-Relación"}
+                      </span>
+                      <div style={styles.tarjetaAcciones}>
+                        <span style={styles.fecha}>
+                          {new Date(d.fechaModificacion).toLocaleDateString("es-PE")}
+                        </span>
+                        {soyPropietario && (
+                          <button
+                            type="button"
+                            style={styles.botonEliminar}
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              if (!window.confirm(`¿Eliminar el diagrama "${d.titulo}"? Esta acción no se puede deshacer.`)) {
+                                return;
+                              }
+
+                              const respuesta = await fetch(`/diagramas/${d.id}`, {
+                                method: "DELETE",
+                                headers: { Authorization: `Bearer ${token}` },
+                              });
+
+                              if (respuesta.ok) {
+                                await cargarDiagramas();
+                              } else if (respuesta.status === 403) {
+                                alert("Solo el propietario puede eliminar el diagrama");
+                              } else {
+                                alert("Error al eliminar el diagrama");
+                              }
+                            }}
+                          >
+                            Eliminar
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <h3 style={styles.tarjetaTitulo}>{d.titulo}</h3>
+                    <p style={styles.tarjetaColabs}>
+                      {(d.colaboraciones || []).map((c) => c?.usuario?.nombre).filter(Boolean).join(", ") || "Sin colaboradores"}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </ErrorBoundary>
         )}
       </main>
 
@@ -178,11 +244,16 @@ const styles: Record<string, React.CSSProperties> = {
     transition: "box-shadow 0.15s",
   },
   tarjetaHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" },
+  tarjetaAcciones: { display: "flex", alignItems: "center", gap: "0.5rem" },
   tipoBadge: {
     fontSize: "0.75rem", padding: "0.2rem 0.5rem", borderRadius: "4px",
     backgroundColor: "#e8eaf6", color: "#3949ab", fontWeight: 600,
   },
   fecha: { fontSize: "0.75rem", color: "#999" },
+  botonEliminar: {
+    backgroundColor: "#ffe5e5", color: "#e63946", padding: "0.25rem 0.5rem",
+    borderRadius: "4px", fontSize: "0.75rem", cursor: "pointer", border: "none",
+  },
   tarjetaTitulo: { margin: "0 0 0.5rem", fontSize: "1rem", color: "#1a1a2e" },
   tarjetaColabs: { margin: 0, fontSize: "0.8rem", color: "#888" },
   overlay: {

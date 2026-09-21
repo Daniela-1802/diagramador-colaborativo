@@ -52,6 +52,55 @@ router.get("/", async (req: AuthRequest, res: Response): Promise<void> => {
   res.json(diagramas);
 });
 
+router.delete("/:id", async (req: AuthRequest, res: Response): Promise<void> => {
+  const { id } = req.params;
+
+  const diagrama = await prisma.diagrama.findUnique({ where: { id } });
+  if (!diagrama) {
+    res.status(404).json({ error: "Diagrama no encontrado" });
+    return;
+  }
+
+  const colaboracion = await prisma.colaboracion.findUnique({
+    where: { usuarioId_diagramaId: { usuarioId: req.usuarioId!, diagramaId: id } },
+  });
+
+  if (!colaboracion) {
+    res.status(403).json({ error: "No tienes acceso a este diagrama" });
+    return;
+  }
+
+  if (colaboracion.rol !== RolColaborador.PROPIETARIO) {
+    res.status(403).json({ error: "Solo el propietario puede eliminar el diagrama" });
+    return;
+  }
+
+  await prisma.$transaction([
+    prisma.relacionUML.deleteMany({
+      where: {
+        OR: [
+          { origen: { diagramaId: id } },
+          { destino: { diagramaId: id } },
+        ],
+      },
+    }),
+    prisma.atributo.deleteMany({
+      where: { elementoDiagrama: { diagramaId: id } },
+    }),
+    prisma.colaboracion.deleteMany({ where: { diagramaId: id } }),
+    prisma.elementoDiagrama.deleteMany({ where: { diagramaId: id } }),
+    prisma.diagrama.delete({ where: { id } }),
+    prisma.registroSesion.create({
+      data: {
+        usuarioId: req.usuarioId!,
+        accion: `Eliminó el diagrama "${diagrama.titulo}"`,
+      },
+    }),
+  ]);
+
+  res.status(200).json({ mensaje: "Diagrama eliminado exitosamente" });
+});
+
 router.get("/:id", async (req: AuthRequest, res: Response): Promise<void> => {
   const { id } = req.params;
 

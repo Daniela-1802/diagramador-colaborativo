@@ -467,6 +467,26 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           new go.Binding("itemArray", "atributos")
         )
       ),
+      $(go.TextBlock, "×", {
+        name: "botonEliminar",
+        alignment: go.Spot.TopRight,
+        margin: 4,
+        font: "bold 14px sans-serif",
+        stroke: "#e63946",
+        cursor: "pointer",
+        background: "white",
+        isActionable: true,
+        click: (event, object) => {
+          event.handled = true;
+          const node = object.part;
+          if (!(node instanceof go.Node)) return;
+          const elementoId = node.data.key as string;
+          const elementoNombre = node.data.nombre as string;
+          if (window.confirm(`¿Eliminar la clase "${elementoNombre}"? Se eliminarán también sus relaciones y atributos.`)) {
+            socket.emit("elemento:eliminar", { diagramaId, elementoId });
+          }
+        },
+      }, new go.Binding("visible", "key")),
       $(go.Shape, "Circle", {
         alignment: go.Spot.Right,
         width: 14,
