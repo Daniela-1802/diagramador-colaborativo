@@ -1,10 +1,14 @@
 import { Router, Response } from "express";
 import { RolColaborador } from "@prisma/client";
+import { XMLParser } from "fast-xml-parser";
+import multer from "multer";
+import { Server } from "socket.io";
 import { create } from "xmlbuilder2";
 import prisma from "../lib/prisma";
 import { autenticarJWT, AuthRequest } from "../middleware/auth";
 
 const router = Router();
+const upload = multer({ storage: multer.memoryStorage() });
 
 router.use(autenticarJWT);
 
@@ -245,6 +249,188 @@ router.get("/:id/exportar-xmi", async (req: AuthRequest, res: Response): Promise
   res.type("application/xml");
   res.setHeader("Content-Disposition", `attachment; filename="${nombreArchivo}"`);
   res.send(xml);
+});
+
+router.post("/:id/importar-xmi", upload.single("archivo"), async (req: AuthRequest, res: Response): Promise<void> => {
+  const { id } = req.params;
+  const diagrama = await prisma.diagrama.findUnique({ where: { id } });
+  if (!diagrama) {
+    res.status(404).json({ error: "Diagrama no encontrado" });
+    return;
+  }
+
+  const colaboracion = await prisma.colaboracion.findUnique({
+    where: { usuarioId_diagramaId: { usuarioId: req.usuarioId!, diagramaId: id } },
+  });
+  if (!colaboracion) {
+    res.status(403).json({ error: "No tienes acceso a este diagrama" });
+    return;
+  }
+  if (colaboracion.rol !== RolColaborador.PROPIETARIO && colaboracion.rol !== RolColaborador.COLABORADOR) {
+    res.status(403).json({ error: "No tienes permisos para importar en este diagrama" });
+    return;
+  }
+  if (!req.file) {
+    res.status(400).json({ error: "Debes adjuntar un archivo XMI" });
+    return;
+  }
+
+  const asArray = (value: unknown): Record<string, any>[] => {
+    if (!value) return [];
+    return Array.isArray(value) ? value as Record<string, any>[] : [value as Record<string, any>];
+  };
+  const atributo = (node: Record<string, any>, nombre: string) =>
+    node[`@_xmi:${nombre}`] ?? node[`@_${nombre}`];
+  const tipoElemento = (node: Record<string, any>) => atributo(node, "type");
+  const texto = (value: unknown) => value === undefined || value === null ? undefined : String(value);
+
+  let contenido: Record<string, any>;
+  try {
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: "@_",
+      parseTagValue: false,
+      trimValues: true,
+    });
+    contenido = parser.parse(req.file.buffer.toString("utf8")) as Record<string, any>;
+  } catch {
+    res.status(400).json({ error: "El archivo XMI no es válido" });
+    return;
+  }
+
+  const raiz = contenido["xmi:XMI"] || contenido.XMI;
+  const modelo = raiz?.["uml:Model"] || raiz?.Model;
+  const buscarPaquete = (node: Record<string, any>): Record<string, any> | null => {
+    for (const elemento of asArray(node?.packagedElement)) {
+      if (tipoElemento(elemento) === "uml:Package") return elemento;
+      const encontrado = buscarPaquete(elemento);
+      if (encontrado) return encontrado;
+    }
+    return null;
+  };
+  const paquete = buscarPaquete(modelo);
+  if (!paquete) {
+    res.status(400).json({ error: "El XMI no contiene un paquete UML válido" });
+    return;
+  }
+
+  const elementos = asArray(paquete.packagedElement);
+  const clases = elementos.filter((elemento) => tipoElemento(elemento) === "uml:Class");
+  const mapaElementos = new Map<string, string>();
+  const mapaTipo = (href: unknown) => {
+    const tipo = String(href || "").split("#").pop() || "string";
+    return ({ String: "string", Integer: "int", Boolean: "boolean", Real: "decimal", Date: "Date" } as Record<string, string>)[tipo] || tipo;
+  };
+  const mapaVisibilidad = (visibility: unknown) =>
+    ({ public: "+", private: "-", protected: "#" } as Record<string, string>)[String(visibility)] || "+";
+  const datosElementos: {
+    originalId: string;
+    nombre: string;
+    atributos: { nombre: string; tipoDato: string; visibilidad: string }[];
+    posicionX: number;
+    posicionY: number;
+  }[] = [];
+
+  clases.forEach((clase) => {
+    const originalId = String(atributo(clase, "id") || "");
+    if (!originalId) return;
+    const atributos = asArray(clase.ownedAttribute).map((item) => ({
+      nombre: String(atributo(item, "name") || "Atributo"),
+      tipoDato: mapaTipo(atributo(asArray(item.type)[0] || {}, "href")),
+      visibilidad: mapaVisibilidad(atributo(item, "visibility")),
+    }));
+    mapaElementos.set(originalId, "");
+    datosElementos.push({
+      originalId,
+      nombre: String(atributo(clase, "name") || "Clase importada"),
+      atributos,
+      posicionX: 100 + Math.random() * 400,
+      posicionY: 100 + Math.random() * 400,
+    });
+  });
+
+  const multiplicidad = (end: Record<string, any>) => {
+    const lower = texto(atributo(asArray(end.lowerValue)[0] || {}, "value"));
+    const upper = texto(atributo(asArray(end.upperValue)[0] || {}, "value"));
+    if (!lower || !upper) return "1..*";
+    if (lower === "1" && upper === "1") return "1";
+    if (lower === "1" && upper === "*") return "1..*";
+    if (lower === "0" && upper === "1") return "0..1";
+    if (lower === "0" && upper === "*") return "0..*";
+    return `${lower}..${upper}`;
+  };
+  const relaciones = elementos.filter((elemento) => ["uml:Association", "uml:Generalization"].includes(tipoElemento(elemento)));
+  const emitidos: { elementos: any[]; atributos: any[]; relaciones: any[] } = { elementos: [], atributos: [], relaciones: [] };
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      for (const datos of datosElementos) {
+        const elemento = await tx.elementoDiagrama.create({
+          data: {
+            diagramaId: id,
+            nombre: datos.nombre,
+            tipo: "CLASE",
+            posicionX: datos.posicionX,
+            posicionY: datos.posicionY,
+          },
+          select: { id: true, nombre: true, tipo: true, posicionX: true, posicionY: true },
+        });
+        mapaElementos.set(datos.originalId, elemento.id);
+        emitidos.elementos.push({ ...elemento, diagramaId: id, atributos: [] });
+        for (const datoAtributo of datos.atributos) {
+          const creado = await tx.atributo.create({
+            data: { ...datoAtributo, elementoDiagramaId: elemento.id },
+            select: { id: true, nombre: true, tipoDato: true, visibilidad: true },
+          });
+          emitidos.atributos.push({ ...creado, elementoId: elemento.id });
+        }
+      }
+
+      for (const relacion of relaciones) {
+        let origenOriginal: string | undefined;
+        let destinoOriginal: string | undefined;
+        let tipo = "ASOCIACION";
+        let multiplicidadOrigen = "1..*";
+        let multiplicidadDestino = "1..*";
+        if (tipoElemento(relacion) === "uml:Generalization") {
+          origenOriginal = texto(atributo(relacion, "specific"));
+          destinoOriginal = texto(atributo(relacion, "general"));
+          tipo = "HERENCIA";
+        } else {
+          const extremos = asArray(relacion.ownedEnd);
+          if (extremos.length < 2) continue;
+          origenOriginal = texto(atributo(extremos[0], "type"));
+          destinoOriginal = texto(atributo(extremos[1], "type"));
+          multiplicidadOrigen = multiplicidad(extremos[0]);
+          multiplicidadDestino = multiplicidad(extremos[1]);
+          const aggregation = atributo(extremos[0], "aggregation");
+          tipo = aggregation === "composite" ? "COMPOSICION" : aggregation === "shared" ? "AGREGACION" : "ASOCIACION";
+        }
+        const origenId = origenOriginal ? mapaElementos.get(origenOriginal) : undefined;
+        const destinoId = destinoOriginal ? mapaElementos.get(destinoOriginal) : undefined;
+        if (!origenId || !destinoId) continue;
+        const creada = await tx.relacionUML.create({
+          data: { tipo, multiplicidadOrigen, multiplicidadDestino, origenId, destinoId },
+          select: { id: true, tipo: true, multiplicidadOrigen: true, multiplicidadDestino: true, origenId: true, destinoId: true },
+        });
+        emitidos.relaciones.push(creada);
+      }
+      await tx.registroSesion.create({
+        data: { usuarioId: req.usuarioId!, accion: `Importó ${datosElementos.length} clases, ${emitidos.relaciones.length} relaciones desde XMI` },
+      });
+    });
+  } catch (error) {
+    console.error("[Importar XMI] Error:", error);
+    res.status(500).json({ error: "Error al importar el diagrama XMI" });
+    return;
+  }
+
+  const io = req.app.get("io") as Server | undefined;
+  const sala = `diagrama:${id}`;
+  emitidos.elementos.forEach((elemento) => io?.to(sala).emit("elemento:creado", elemento));
+  emitidos.atributos.forEach((atributoCreado) => io?.to(sala).emit("atributo:creado", atributoCreado));
+  emitidos.relaciones.forEach((relacion) => io?.to(sala).emit("relacion:creada", relacion));
+  res.status(200).json({ clasesImportadas: datosElementos.length, relacionesImportadas: emitidos.relaciones.length, errores: [] });
 });
 
 router.get("/:id", async (req: AuthRequest, res: Response): Promise<void> => {

@@ -98,6 +98,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   const [visibilidadAtributo, setVisibilidadAtributo] = useState("+");
 
   const diagramContainerRef = useRef<HTMLDivElement>(null);
+  const archivoXmiRef = useRef<HTMLInputElement>(null);
   const diagramInstanceRef = useRef<go.Diagram | null>(null);
   const nodePositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const reconocimientoRef = useRef<SpeechRecognitionLike | null>(null);
@@ -742,6 +743,27 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     window.URL.revokeObjectURL(url);
   };
 
+  const handleImportarXMI = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const archivo = event.target.files?.[0];
+    event.target.value = "";
+    if (!archivo) return;
+
+    const formData = new FormData();
+    formData.append("archivo", archivo);
+    const res = await fetch(`/diagramas/${diagramaId}/importar-xmi`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: formData,
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || "Error al importar el diagrama");
+      return;
+    }
+    alert(`Importadas ${data.clasesImportadas} clases y ${data.relacionesImportadas} relaciones`);
+    socket.emit("diagrama:unirse", { diagramaId, token });
+  };
+
   const iniciarEscucha = () => {
     const speechWindow = window as WindowWithSpeechRecognition;
     const SpeechRecognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
@@ -844,6 +866,16 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           <button style={styles.botonExportar} onClick={handleExportarXMI}>
             Exportar XMI
           </button>
+          <button style={styles.botonExportar} onClick={() => archivoXmiRef.current?.click()}>
+            Importar XMI
+          </button>
+          <input
+            ref={archivoXmiRef}
+            type="file"
+            accept=".xmi,.xml"
+            hidden
+            onChange={handleImportarXMI}
+          />
         </div>
       </header>
       <main style={styles.main}>
