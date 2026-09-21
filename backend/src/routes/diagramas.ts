@@ -1,5 +1,6 @@
 import { Router, Response } from "express";
 import { RolColaborador } from "@prisma/client";
+import { create } from "xmlbuilder2";
 import prisma from "../lib/prisma";
 import { autenticarJWT, AuthRequest } from "../middleware/auth";
 
@@ -99,6 +100,151 @@ router.delete("/:id", async (req: AuthRequest, res: Response): Promise<void> => 
   ]);
 
   res.status(200).json({ mensaje: "Diagrama eliminado exitosamente" });
+});
+
+router.get("/:id/exportar-xmi", async (req: AuthRequest, res: Response): Promise<void> => {
+  const { id } = req.params;
+
+  const diagrama = await prisma.diagrama.findUnique({ where: { id } });
+  if (!diagrama) {
+    res.status(404).json({ error: "Diagrama no encontrado" });
+    return;
+  }
+
+  const colaboracion = await prisma.colaboracion.findUnique({
+    where: { usuarioId_diagramaId: { usuarioId: req.usuarioId!, diagramaId: id } },
+  });
+  if (!colaboracion) {
+    res.status(403).json({ error: "No tienes acceso a este diagrama" });
+    return;
+  }
+
+  const [elementos, relaciones] = await Promise.all([
+    prisma.elementoDiagrama.findMany({
+      where: { diagramaId: id },
+      include: { atributos: true },
+    }),
+    prisma.relacionUML.findMany({
+      where: {
+        OR: [
+          { origen: { diagramaId: id } },
+          { destino: { diagramaId: id } },
+        ],
+      },
+      include: { origen: true, destino: true },
+    }),
+  ]);
+
+  const tipoPrimitivo = (tipoDato: string) => ({
+    string: "String",
+    int: "Integer",
+    boolean: "Boolean",
+    Date: "Date",
+    decimal: "Real",
+  }[tipoDato] || tipoDato);
+
+  const multiplicidad = (valor: string | null) => {
+    if (valor === "1") return { min: "1", max: "1" };
+    if (valor === "*") return { min: "0", max: "*" };
+    if (valor === "0..1") return { min: "0", max: "1" };
+    if (valor === "1..*") return { min: "1", max: "*" };
+    if (valor === "0..*") return { min: "0", max: "*" };
+    const rango = valor?.match(/^(\d+)\.\.(\d+|\*)$/);
+    if (rango) return { min: rango[1], max: rango[2] };
+    return { min: "0", max: "*" };
+  };
+
+  const document = create({ version: "1.0", encoding: "UTF-8" });
+  const xmi = document.ele("xmi:XMI", {
+    "xmi:version": "2.5.1",
+    "xmlns:xmi": "http://www.omg.org/spec/XMI/20131001",
+    "xmlns:uml": "http://www.omg.org/spec/UML/20131001",
+  });
+  xmi.ele("xmi:Documentation", {
+    exporter: "Diagramador Colaborativo UML",
+    exporterVersion: "1.0",
+  }).up();
+
+  const model = xmi.ele("uml:Model", {
+    "xmi:type": "uml:Model",
+    name: diagrama.titulo,
+    "xmi:id": `model_${diagrama.id}`,
+  });
+  const paquete = model.ele("packagedElement", {
+    "xmi:type": "uml:Package",
+    "xmi:id": `pkg_${diagrama.id}`,
+    name: diagrama.titulo,
+  });
+
+  elementos.forEach((elemento) => {
+    const clase = paquete.ele("packagedElement", {
+      "xmi:type": "uml:Class",
+      "xmi:id": elemento.id,
+      name: elemento.nombre,
+    });
+    elemento.atributos.forEach((atributo) => {
+      const ownedAttribute = clase.ele("ownedAttribute", {
+        "xmi:type": "uml:Property",
+        "xmi:id": atributo.id,
+        name: atributo.nombre,
+        visibility: atributo.visibilidad === "+" ? "public" : atributo.visibilidad === "-" ? "private" : atributo.visibilidad === "#" ? "protected" : "public",
+      });
+      ownedAttribute.ele("type", {
+        "xmi:type": "uml:PrimitiveType",
+        href: `http://www.omg.org/spec/UML/20131001/PrimitiveTypes.xmi#${tipoPrimitivo(atributo.tipoDato)}`,
+      }).up();
+      ownedAttribute.up();
+    });
+    clase.up();
+  });
+
+  relaciones.forEach((relacion) => {
+    if (relacion.tipo === "HERENCIA") {
+      paquete.ele("packagedElement", {
+        "xmi:type": "uml:Generalization",
+        "xmi:id": relacion.id,
+        general: relacion.destinoId,
+        specific: relacion.origenId,
+      }).up();
+      return;
+    }
+
+    const association = paquete.ele("packagedElement", {
+      "xmi:type": "uml:Association",
+      "xmi:id": relacion.id,
+      name: `${relacion.origen.nombre}_${relacion.destino.nombre}`,
+    });
+    association.ele("memberEnd", { "xmi:idref": `${relacion.id}_end1` }).up();
+    association.ele("memberEnd", { "xmi:idref": `${relacion.id}_end2` }).up();
+    const aggregation = relacion.tipo === "COMPOSICION" ? "composite" : relacion.tipo === "AGREGACION" ? "shared" : undefined;
+    [
+      { id: relacion.origenId, multiplicidad: relacion.multiplicidadOrigen, aggregation },
+      { id: relacion.destinoId, multiplicidad: relacion.multiplicidadDestino, aggregation: undefined },
+    ].forEach((extremo, index) => {
+      const rango = multiplicidad(extremo.multiplicidad);
+      const ownedEnd = association.ele("ownedEnd", {
+        "xmi:type": "uml:Property",
+        "xmi:id": `${relacion.id}_end${index + 1}`,
+        type: extremo.id,
+        association: relacion.id,
+        ...(extremo.aggregation ? { aggregation: extremo.aggregation } : {}),
+      });
+      ownedEnd.ele("lowerValue", { "xmi:type": "uml:LiteralInteger", value: rango.min }).up();
+      ownedEnd.ele("upperValue", { "xmi:type": "uml:LiteralUnlimitedNatural", value: rango.max }).up();
+      ownedEnd.up();
+    });
+    association.up();
+  });
+
+  const xml = document.end({ prettyPrint: true });
+  await prisma.registroSesion.create({
+    data: { usuarioId: req.usuarioId!, accion: "Exportó diagrama a XMI" },
+  });
+
+  const nombreArchivo = (diagrama.titulo.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "diagrama") + ".xmi";
+  res.type("application/xml");
+  res.setHeader("Content-Disposition", `attachment; filename="${nombreArchivo}"`);
+  res.send(xml);
 });
 
 router.get("/:id", async (req: AuthRequest, res: Response): Promise<void> => {

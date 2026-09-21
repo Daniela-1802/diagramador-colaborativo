@@ -501,7 +501,10 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
         toLinkable: true,
         toLinkableSelfNode: false,
         toLinkableDuplicates: false,
-        cursor: "pointer",
+        
+
+
+        
         fromSpot: go.Spot.Right,
         toSpot: go.Spot.Right,
       }),
@@ -720,6 +723,25 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     setAtributosNodo([]);
   };
 
+  const handleExportarXMI = async () => {
+    const res = await fetch(`/diagramas/${diagramaId}/exportar-xmi`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      alert("Error al exportar el diagrama");
+      return;
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `diagrama-${diagrama.titulo.replace(/\s+/g, "-")}.xmi`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  };
+
   const iniciarEscucha = () => {
     const speechWindow = window as WindowWithSpeechRecognition;
     const SpeechRecognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
@@ -815,9 +837,14 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           <button style={styles.botonVolver} onClick={onVolver}>&larr; Volver</button>
           <h1 style={styles.titulo}>{diagrama.titulo}</h1>
         </div>
-        <span style={styles.tipoBadge}>
-          {diagrama.tipo === "CLASES" ? "Diagrama de Clases" : "Entidad-Relación"}
-        </span>
+        <div>
+          <span style={styles.tipoBadge}>
+            {diagrama.tipo === "CLASES" ? "Diagrama de Clases" : "Entidad-Relación"}
+          </span>
+          <button style={styles.botonExportar} onClick={handleExportarXMI}>
+            Exportar XMI
+          </button>
+        </div>
       </header>
       <main style={styles.main}>
         <section style={styles.seccion}>
@@ -1074,6 +1101,11 @@ const styles: Record<string, React.CSSProperties> = {
   tipoBadge: {
     fontSize: "0.75rem", padding: "0.25rem 0.6rem", borderRadius: "4px",
     backgroundColor: "rgba(255,255,255,0.15)", fontWeight: 600,
+  },
+  botonExportar: {
+    backgroundColor: "rgba(255,255,255,0.15)", color: "white", padding: "0.25rem 0.6rem",
+    borderRadius: "4px", border: "1px solid rgba(255,255,255,0.3)", cursor: "pointer",
+    fontSize: "0.75rem", fontWeight: 600, marginLeft: "0.5rem",
   },
   main: { padding: "2rem", maxWidth: "1000px", margin: "0 auto" },
   seccion: { marginBottom: "2rem" },
