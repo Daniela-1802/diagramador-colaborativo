@@ -6,9 +6,11 @@ import { Server } from "socket.io";
 import { create } from "xmlbuilder2";
 import prisma from "../lib/prisma";
 import { autenticarJWT, AuthRequest } from "../middleware/auth";
+import { interpretarImagenUML } from "../gemini";
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
+const uploadImagen = multer({ storage: multer.memoryStorage() });
 
 router.use(autenticarJWT);
 
@@ -533,6 +535,122 @@ router.post("/:id/importar-xmi", upload.single("archivo"), async (req: AuthReque
     io?.to(sala).emit("relacion:creada", relacion);
   });
   res.status(200).json({ clasesImportadas: datosElementos.length, relacionesImportadas: emitidos.relaciones.length, errores: [] });
+});
+
+router.post("/:id/importar-imagen", uploadImagen.single("imagen"), async (req: AuthRequest, res: Response): Promise<void> => {
+  const { id } = req.params;
+  const diagrama = await prisma.diagrama.findUnique({ where: { id } });
+  if (!diagrama) {
+    res.status(404).json({ error: "Diagrama no encontrado" });
+    return;
+  }
+
+  const colaboracion = await prisma.colaboracion.findUnique({
+    where: { usuarioId_diagramaId: { usuarioId: req.usuarioId!, diagramaId: id } },
+  });
+  if (!colaboracion) {
+    res.status(403).json({ error: "No tienes acceso a este diagrama" });
+    return;
+  }
+  if (colaboracion.rol !== RolColaborador.PROPIETARIO && colaboracion.rol !== RolColaborador.COLABORADOR) {
+    res.status(403).json({ error: "No tienes permisos para importar en este diagrama" });
+    return;
+  }
+  if (!req.file) {
+    res.status(400).json({ error: "Debes adjuntar una imagen" });
+    return;
+  }
+  const tiposImagenPermitidos = new Set(["image/png", "image/jpeg", "image/webp"]);
+  if (!tiposImagenPermitidos.has(req.file.mimetype)) {
+    res.status(400).json({ error: "La imagen debe ser PNG, JPG, JPEG o WebP" });
+    return;
+  }
+  if (req.file.size >= 5 * 1024 * 1024) {
+    res.status(400).json({ error: "La imagen debe pesar menos de 5 MB" });
+    return;
+  }
+
+  let interpretacion;
+  try {
+    interpretacion = await interpretarImagenUML(req.file.buffer, req.file.mimetype);
+  } catch (error) {
+    console.error("[importar-imagen] Error al analizar imagen:", error);
+    res.status(500).json({ error: "No se pudo analizar la imagen UML" });
+    return;
+  }
+
+  const emitidos: { elementos: any[]; atributos: any[]; relaciones: any[] } = {
+    elementos: [],
+    atributos: [],
+    relaciones: [],
+  };
+  const clasesPorNombre = new Map<string, string>();
+  const normalizarNombre = (nombre: string) => nombre.trim().toLocaleLowerCase();
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      for (const clase of interpretacion.clases) {
+        const elemento = await tx.elementoDiagrama.create({
+          data: {
+            diagramaId: id,
+            nombre: clase.nombre,
+            tipo: "CLASE",
+            posicionX: 100 + Math.random() * 400,
+            posicionY: 100 + Math.random() * 400,
+          },
+          select: { id: true, nombre: true, tipo: true, posicionX: true, posicionY: true },
+        });
+        clasesPorNombre.set(normalizarNombre(clase.nombre), elemento.id);
+        emitidos.elementos.push({ ...elemento, diagramaId: id, atributos: [] });
+
+        for (const atributo of clase.atributos || []) {
+          const creado = await tx.atributo.create({
+            data: {
+              elementoDiagramaId: elemento.id,
+              nombre: atributo.nombre,
+              tipoDato: atributo.tipoDato || "string",
+              visibilidad: atributo.visibilidad || "+",
+            },
+            select: { id: true, nombre: true, tipoDato: true, visibilidad: true },
+          });
+          emitidos.atributos.push({ ...creado, elementoId: elemento.id });
+        }
+      }
+
+      for (const relacion of interpretacion.relaciones) {
+        const origenId = clasesPorNombre.get(normalizarNombre(relacion.origen));
+        const destinoId = clasesPorNombre.get(normalizarNombre(relacion.destino));
+        if (!origenId || !destinoId) continue;
+
+        const creada = await tx.relacionUML.create({
+          data: {
+            tipo: relacion.tipo || "ASOCIACION",
+            multiplicidadOrigen: relacion.multiplicidadOrigen || "1..*",
+            multiplicidadDestino: relacion.multiplicidadDestino || "1..*",
+            origenId,
+            destinoId,
+          },
+          select: { id: true, tipo: true, multiplicidadOrigen: true, multiplicidadDestino: true, origenId: true, destinoId: true },
+        });
+        emitidos.relaciones.push(creada);
+      }
+
+      await tx.registroSesion.create({
+        data: { usuarioId: req.usuarioId!, accion: "Importó diagrama desde imagen" },
+      });
+    });
+  } catch (error) {
+    console.error("[importar-imagen] Error al guardar diagrama:", error);
+    res.status(500).json({ error: "No se pudo guardar el diagrama importado" });
+    return;
+  }
+
+  const io = req.app.get("io") as Server | undefined;
+  const sala = `diagrama:${id}`;
+  emitidos.elementos.forEach((elemento) => io?.to(sala).emit("elemento:creado", elemento));
+  emitidos.atributos.forEach((atributoCreado) => io?.to(sala).emit("atributo:creado", atributoCreado));
+  emitidos.relaciones.forEach((relacion) => io?.to(sala).emit("relacion:creada", relacion));
+  res.status(200).json({ clasesImportadas: emitidos.elementos.length, relacionesImportadas: emitidos.relaciones.length, errores: [] });
 });
 
 router.get("/:id", async (req: AuthRequest, res: Response): Promise<void> => {

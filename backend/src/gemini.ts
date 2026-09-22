@@ -266,3 +266,91 @@ export async function interpretarComando(texto: string, nombresClasesExistentes:
 }
 
 export type ResultadoComando = { acciones: AccionComando[] } | AccionComando;
+
+export interface ResultadoImagenUML {
+  clases: {
+    nombre: string;
+    atributos: { nombre: string; tipoDato: string; visibilidad: string }[];
+  }[];
+  relaciones: {
+    origen: string;
+    destino: string;
+    tipo: string;
+    multiplicidadOrigen: string;
+    multiplicidadDestino: string;
+  }[];
+}
+
+const instruccionImagenUML = `Eres un analizador de diagramas UML. Recibes una imagen que contiene
+un diagrama de clases UML (puede ser una foto de un pizarrón, un
+dibujo a mano, o una captura de otra herramienta).
+
+Tu tarea es extraer:
+1. Todas las CLASES visibles. Cada clase tiene un nombre y puede tener
+   ATRIBUTOS listados dentro. Para cada atributo, extrae:
+   - nombre (identificador)
+   - tipoDato (string, int, boolean, Date, decimal, etc. Si no se
+     menciona, usa 'string')
+   - visibilidad ('+', '-', '#' o '~'. Si no se ve, usa '+')
+2. Todas las RELACIONES entre clases. Para cada relación extrae:
+   - origen (nombre de la clase origen)
+   - destino (nombre de la clase destino)
+   - tipo ('ASOCIACION' por defecto. Si hay herencia con triángulo,
+     'HERENCIA'. Si hay rombo relleno, 'COMPOSICION'. Si hay rombo
+     hueco, 'AGREGACION')
+   - multiplicidadOrigen ('1', '*', '0..1', '1..*', '0..*'. Default '1..*')
+   - multiplicidadDestino (mismo formato, default '1..*')
+
+Responde ÚNICAMENTE con un JSON con esta estructura:
+{
+  "clases": [{ "nombre": "Usuario", "atributos": [{ "nombre": "id", "tipoDato": "int", "visibilidad": "+" }] }],
+  "relaciones": [{ "origen": "Usuario", "destino": "Producto", "tipo": "ASOCIACION", "multiplicidadOrigen": "1..*", "multiplicidadDestino": "0..*" }]
+}
+
+Si no detectas clases o relaciones, devuelve arrays vacíos. No agregues
+texto fuera del JSON. Si la imagen no es un diagrama UML, devuelve
+{ "clases": [], "relaciones": [] }.`;
+
+export async function interpretarImagenUML(
+  imageBuffer: Buffer,
+  mimeType: string
+): Promise<ResultadoImagenUML> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY no está configurada");
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const generativeModel = genAI.getGenerativeModel({
+    model: "gemini-3.5-flash-lite",
+    systemInstruction: instruccionImagenUML,
+    generationConfig: { responseMimeType: "application/json" },
+  });
+
+  const contenidoImagen = {
+    contents: [{
+      role: "user",
+      parts: [{
+        inlineData: {
+          mimeType,
+          data: imageBuffer.toString("base64"),
+        },
+      }],
+    }],
+  };
+  const esperas = [1000, 2000, 4000];
+  let result;
+  for (let intento = 0; intento < 3; intento += 1) {
+    try {
+      result = await generativeModel.generateContent(contenidoImagen);
+      break;
+    } catch (error) {
+      if (!esErrorReintentable(error) || intento === 2) throw error;
+      await espera(esperas[intento]);
+    }
+  }
+  if (!result) throw new Error("No se obtuvo respuesta de Gemini");
+  const respuesta = JSON.parse(result.response.text()) as Partial<ResultadoImagenUML>;
+  return {
+    clases: Array.isArray(respuesta.clases) ? respuesta.clases : [],
+    relaciones: Array.isArray(respuesta.relaciones) ? respuesta.relaciones : [],
+  };
+}

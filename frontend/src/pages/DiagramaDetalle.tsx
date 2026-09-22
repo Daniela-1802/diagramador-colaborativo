@@ -105,9 +105,11 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   const [nombreAtributo, setNombreAtributo] = useState("");
   const [tipoDatoAtributo, setTipoDatoAtributo] = useState("");
   const [visibilidadAtributo, setVisibilidadAtributo] = useState("+");
+  const [cargandoImportacionImagen, setCargandoImportacionImagen] = useState(false);
 
   const diagramContainerRef = useRef<HTMLDivElement>(null);
   const archivoXmiRef = useRef<HTMLInputElement>(null);
+  const archivoImagenRef = useRef<HTMLInputElement>(null);
   const diagramInstanceRef = useRef<go.Diagram | null>(null);
   const nodePositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const relacionesPendientesRef = useRef<RelacionRemota[]>([]);
@@ -797,6 +799,34 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     socket.emit("diagrama:unirse", { diagramaId, token });
   };
 
+  const handleImportarImagen = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const imagen = event.target.files?.[0];
+    event.target.value = "";
+    if (!imagen) return;
+
+    setCargandoImportacionImagen(true);
+    try {
+      const formData = new FormData();
+      formData.append("imagen", imagen);
+      const res = await fetch(`/diagramas/${diagramaId}/importar-imagen`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || "Error al importar la imagen");
+        return;
+      }
+      alert(`Importadas ${data.clasesImportadas} clases y ${data.relacionesImportadas} relaciones`);
+      socket.emit("diagrama:unirse", { diagramaId, token });
+    } catch {
+      alert("No se pudo conectar con el servidor para importar la imagen");
+    } finally {
+      setCargandoImportacionImagen(false);
+    }
+  };
+
   const iniciarEscucha = () => {
     const speechWindow = window as WindowWithSpeechRecognition;
     const SpeechRecognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
@@ -902,12 +932,26 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           <button style={styles.botonExportar} onClick={() => archivoXmiRef.current?.click()}>
             Importar XMI
           </button>
+          <button
+            style={styles.botonExportar}
+            onClick={() => archivoImagenRef.current?.click()}
+            disabled={cargandoImportacionImagen}
+          >
+            {cargandoImportacionImagen ? "Analizando imagen..." : "Importar imagen"}
+          </button>
           <input
             ref={archivoXmiRef}
             type="file"
             accept=".xmi,.xml"
             hidden
             onChange={handleImportarXMI}
+          />
+          <input
+            ref={archivoImagenRef}
+            type="file"
+            accept="image/*"
+            hidden
+            onChange={handleImportarImagen}
           />
         </div>
       </header>
