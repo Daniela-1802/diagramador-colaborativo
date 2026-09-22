@@ -280,19 +280,22 @@ router.post("/:id/importar-xmi", upload.single("archivo"), async (req: AuthReque
     return Array.isArray(value) ? value as Record<string, any>[] : [value as Record<string, any>];
   };
   const atributo = (node: Record<string, any>, nombre: string) =>
-    node[`@_xmi:${nombre}`] ?? node[`@_${nombre}`];
-  const tipoElemento = (node: Record<string, any>) => atributo(node, "type");
+    node[`@_${nombre}`];
+  const atributoXmi = (node: Record<string, any>, nombre: string) =>
+    node[`@_xmi:${nombre}`];
+  const tipoElemento = (node: Record<string, any>) => atributoXmi(node, "type");
   const texto = (value: unknown) => value === undefined || value === null ? undefined : String(value);
 
+  const xml = req.file.buffer.toString("utf8");
+  const formato = xml.includes("omg.org/spec/UML/20131001")
+    ? "PROPIO"
+    : xml.includes("schema.omg.org/spec/UML/2.1")
+      ? "EA"
+      : "GENERICO";
   let contenido: Record<string, any>;
   try {
-    const parser = new XMLParser({
-      ignoreAttributes: false,
-      attributeNamePrefix: "@_",
-      parseTagValue: false,
-      trimValues: true,
-    });
-    contenido = parser.parse(req.file.buffer.toString("utf8")) as Record<string, any>;
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", parseTagValue: false, trimValues: true });
+    contenido = parser.parse(xml) as Record<string, any>;
   } catch {
     res.status(400).json({ error: "El archivo XMI no es válido" });
     return;
@@ -316,42 +319,46 @@ router.post("/:id/importar-xmi", upload.single("archivo"), async (req: AuthReque
 
   const elementos = asArray(paquete.packagedElement);
   const clases = elementos.filter((elemento) => tipoElemento(elemento) === "uml:Class");
-  const mapaElementos = new Map<string, string>();
-  const mapaTipo = (href: unknown) => {
-    const tipo = String(href || "").split("#").pop() || "string";
-    return ({ String: "string", Integer: "int", Boolean: "boolean", Real: "decimal", Date: "Date" } as Record<string, string>)[tipo] || tipo;
+  const extension = raiz?.["xmi:Extension"] || raiz?.Extension || {};
+  const primitivos = new Map<string, string>();
+  const recolectarPrimitivos = (node: Record<string, any>) => {
+    asArray(node?.packagedElement).forEach((elemento) => {
+      if (tipoElemento(elemento) === "uml:PrimitiveType") {
+        const id = texto(atributoXmi(elemento, "id"));
+        const nombre = texto(atributo(elemento, "name"));
+        if (id && nombre) primitivos.set(id, nombre);
+      }
+      recolectarPrimitivos(elemento);
+    });
+  };
+  recolectarPrimitivos(extension?.primitivetypes || {});
+  const mapaTipo = (node: Record<string, any>) => {
+    const referencia = atributo(node, "href") || atributo(node, "idref");
+    const nombre = String(referencia || "").split("#").pop() || "";
+    const tipo = primitivos.get(nombre) || nombre;
+    return ({ String: "string", string: "string", Integer: "int", int: "int", Boolean: "boolean", boolean: "boolean", Real: "decimal", decimal: "decimal", Date: "Date", date: "Date" } as Record<string, string>)[tipo] || "string";
   };
   const mapaVisibilidad = (visibility: unknown) =>
     ({ public: "+", private: "-", protected: "#" } as Record<string, string>)[String(visibility)] || "+";
-  const datosElementos: {
-    originalId: string;
-    nombre: string;
-    atributos: { nombre: string; tipoDato: string; visibilidad: string }[];
-    posicionX: number;
-    posicionY: number;
-  }[] = [];
+  const mapaElementos = new Map<string, string>();
+  const datosElementos: { originalId: string; nombre: string; atributos: { nombre: string; tipoDato: string; visibilidad: string }[]; posicionX: number; posicionY: number }[] = [];
 
   clases.forEach((clase) => {
-    const originalId = String(atributo(clase, "id") || "");
+    const originalId = String(atributoXmi(clase, "id") || "");
     if (!originalId) return;
     const atributos = asArray(clase.ownedAttribute).map((item) => ({
       nombre: String(atributo(item, "name") || "Atributo"),
-      tipoDato: mapaTipo(atributo(asArray(item.type)[0] || {}, "href")),
+      tipoDato: mapaTipo(asArray(item.type)[0] || {}),
       visibilidad: mapaVisibilidad(atributo(item, "visibility")),
     }));
     mapaElementos.set(originalId, "");
-    datosElementos.push({
-      originalId,
-      nombre: String(atributo(clase, "name") || "Clase importada"),
-      atributos,
-      posicionX: 100 + Math.random() * 400,
-      posicionY: 100 + Math.random() * 400,
-    });
+    datosElementos.push({ originalId, nombre: String(atributo(clase, "name") || "Clase importada"), atributos, posicionX: 100 + Math.random() * 400, posicionY: 100 + Math.random() * 400 });
   });
 
   const multiplicidad = (end: Record<string, any>) => {
     const lower = texto(atributo(asArray(end.lowerValue)[0] || {}, "value"));
-    const upper = texto(atributo(asArray(end.upperValue)[0] || {}, "value"));
+    const upperRaw = texto(atributo(asArray(end.upperValue)[0] || {}, "value"));
+    const upper = upperRaw === "-1" ? "*" : upperRaw;
     if (!lower || !upper) return "1..*";
     if (lower === "1" && upper === "1") return "1";
     if (lower === "1" && upper === "*") return "1..*";
@@ -359,9 +366,45 @@ router.post("/:id/importar-xmi", upload.single("archivo"), async (req: AuthReque
     if (lower === "0" && upper === "*") return "0..*";
     return `${lower}..${upper}`;
   };
-  const relaciones = elementos.filter((elemento) => ["uml:Association", "uml:Generalization"].includes(tipoElemento(elemento)));
+  const multiplicidadEA = (tipo: Record<string, any>) => {
+    const valor = texto(atributo(tipo, "multiplicity"));
+    if (!valor) return "1..*";
+    if (valor === "-1") return "0..*";
+    if (/^\d+$/.test(valor)) return valor;
+    if (/^\d+\.\.\d+$/.test(valor) || /^\d+\.\.\*$/.test(valor)) return valor;
+    return "1..*";
+  };
+  const conectores = asArray(extension?.connectors?.connector);
+  const conectorPorId = new Map(conectores.map((conector) => [texto(atributo(conector, "idref") || atributo(conector, "id")), conector]));
+  const tipoConector = (conector: Record<string, any> | undefined) =>
+    String(atributo(conector || {}, "type") || conector?.properties?.["@_ea_type"] || "");
+  const relaciones = elementos.filter((elemento) =>
+    tipoElemento(elemento) === "uml:Generalization" || (formato !== "EA" && tipoElemento(elemento) === "uml:Association")
+  );
+  const relacionesEALinks = formato === "EA"
+    ? asArray(extension?.elements?.element).flatMap((elemento) => asArray(elemento.links?.Association).map((link) => ({
+      id: texto(atributo(link, "id")),
+      origenOriginal: texto(atributo(link, "start")),
+      destinoOriginal: texto(atributo(link, "end")),
+      conector: conectorPorId.get(texto(atributo(link, "id"))),
+    })))
+    : [];
+  const relacionesEAGeneralizacion = formato === "EA"
+    ? conectores.filter((conector) => tipoConector(conector).toLowerCase().includes("generalization")).map((conector) => ({
+      id: texto(atributo(conector, "idref") || atributo(conector, "id")),
+      origenOriginal: texto(atributo(asArray(conector.source)[0] || {}, "idref")),
+      destinoOriginal: texto(atributo(asArray(conector.target)[0] || {}, "idref")),
+      conector,
+    }))
+    : [];
+  const relacionesEA = [...new Map(
+    [...relacionesEALinks, ...relacionesEAGeneralizacion]
+      .filter((relacion) => relacion.id)
+      .map((relacion) => [relacion.id, relacion])
+  ).values()];
   const emitidos: { elementos: any[]; atributos: any[]; relaciones: any[] } = { elementos: [], atributos: [], relaciones: [] };
 
+  console.log("[importar-xmi] INICIO - formato detectado:", formato);
   try {
     await prisma.$transaction(async (tx) => {
       for (const datos of datosElementos) {
@@ -408,28 +451,87 @@ router.post("/:id/importar-xmi", upload.single("archivo"), async (req: AuthReque
         }
         const origenId = origenOriginal ? mapaElementos.get(origenOriginal) : undefined;
         const destinoId = destinoOriginal ? mapaElementos.get(destinoOriginal) : undefined;
-        if (!origenId || !destinoId) continue;
+        if (!origenId || !destinoId) {
+          console.log("[importar-xmi] SKIP relación (sin origen/destino):", { origenOriginal, destinoOriginal, origenId, destinoId });
+          continue;
+        }
         const creada = await tx.relacionUML.create({
           data: { tipo, multiplicidadOrigen, multiplicidadDestino, origenId, destinoId },
           select: { id: true, tipo: true, multiplicidadOrigen: true, multiplicidadDestino: true, origenId: true, destinoId: true },
         });
         emitidos.relaciones.push(creada);
       }
+      for (const relacion of relacionesEA) {
+        if (!relacion.origenOriginal || !relacion.destinoOriginal) continue;
+        const conector = relacion.conector;
+        const source = asArray(conector?.source)[0] || {};
+        const target = asArray(conector?.target)[0] || {};
+        const sourceType = asArray(source.type)[0] || {};
+        const targetType = asArray(target.type)[0] || {};
+        if (tipoConector(conector).toLowerCase().includes("generalization")) {
+          const creada = await tx.relacionUML.create({
+            data: {
+              tipo: "HERENCIA",
+              multiplicidadOrigen: "1..*",
+              multiplicidadDestino: "1..*",
+              origenId: mapaElementos.get(relacion.origenOriginal)!,
+              destinoId: mapaElementos.get(relacion.destinoOriginal)!,
+            },
+            select: { id: true, tipo: true, multiplicidadOrigen: true, multiplicidadDestino: true, origenId: true, destinoId: true },
+          });
+          emitidos.relaciones.push(creada);
+          continue;
+        }
+        const origenId = mapaElementos.get(relacion.origenOriginal);
+        const destinoId = mapaElementos.get(relacion.destinoOriginal);
+        if (!origenId || !destinoId) {
+          console.log("[importar-xmi] SKIP relación (sin origen/destino):", { origenOriginal: relacion.origenOriginal, destinoOriginal: relacion.destinoOriginal, origenId, destinoId });
+          continue;
+        }
+        const aggregation = atributo(sourceType, "aggregation");
+        const tipo = aggregation === "composite" ? "COMPOSICION" : aggregation === "shared" ? "AGREGACION" : "ASOCIACION";
+        const creada = await tx.relacionUML.create({
+          data: {
+            tipo,
+            multiplicidadOrigen: multiplicidadEA(sourceType),
+            multiplicidadDestino: multiplicidadEA(targetType),
+            origenId,
+            destinoId,
+          },
+          select: { id: true, tipo: true, multiplicidadOrigen: true, multiplicidadDestino: true, origenId: true, destinoId: true },
+        });
+        emitidos.relaciones.push(creada);
+      }
       await tx.registroSesion.create({
-        data: { usuarioId: req.usuarioId!, accion: `Importó ${datosElementos.length} clases, ${emitidos.relaciones.length} relaciones desde XMI` },
+        data: { usuarioId: req.usuarioId!, accion: `Importó ${datosElementos.length} clases, ${emitidos.relaciones.length} relaciones desde XMI (${formato})` },
       });
     });
   } catch (error) {
-    console.error("[Importar XMI] Error:", error);
+    console.error("[importar-xmi] ERROR en transaction:", error);
+    console.error("[importar-xmi] Stack:", (error as Error).stack);
     res.status(500).json({ error: "Error al importar el diagrama XMI" });
     return;
   }
 
   const io = req.app.get("io") as Server | undefined;
   const sala = `diagrama:${id}`;
-  emitidos.elementos.forEach((elemento) => io?.to(sala).emit("elemento:creado", elemento));
-  emitidos.atributos.forEach((atributoCreado) => io?.to(sala).emit("atributo:creado", atributoCreado));
-  emitidos.relaciones.forEach((relacion) => io?.to(sala).emit("relacion:creada", relacion));
+  console.log("[importar-xmi] io disponible?", !!io);
+  console.log("[importar-xmi] sala:", sala);
+  console.log("[importar-xmi] elementos a emitir:", emitidos.elementos.length);
+  console.log("[importar-xmi] atributos a emitir:", emitidos.atributos.length);
+  console.log("[importar-xmi] relaciones a emitir:", emitidos.relaciones.length);
+  emitidos.elementos.forEach((elemento) => {
+    console.log("[importar-xmi] Emitiendo elemento:creado", elemento.id);
+    io?.to(sala).emit("elemento:creado", elemento);
+  });
+  emitidos.atributos.forEach((atributoCreado) => {
+    console.log("[importar-xmi] Emitiendo atributo:creado", atributoCreado.id);
+    io?.to(sala).emit("atributo:creado", atributoCreado);
+  });
+  emitidos.relaciones.forEach((relacion) => {
+    console.log("[importar-xmi] Emitiendo relacion:creada", relacion.id);
+    io?.to(sala).emit("relacion:creada", relacion);
+  });
   res.status(200).json({ clasesImportadas: datosElementos.length, relacionesImportadas: emitidos.relaciones.length, errores: [] });
 });
 

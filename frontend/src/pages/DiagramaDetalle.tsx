@@ -74,6 +74,15 @@ interface RelacionSeleccionada {
   multiplicidadDestino: string;
 }
 
+interface RelacionRemota {
+  id: string;
+  tipo: string;
+  origenId: string;
+  destinoId: string;
+  multiplicidadOrigen: string | null;
+  multiplicidadDestino: string | null;
+}
+
 export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) {
   const [diagrama, setDiagrama] = useState<DiagramaData | null>(null);
   const [colaboradores, setColaboradores] = useState<Colaborador[]>([]);
@@ -101,6 +110,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   const archivoXmiRef = useRef<HTMLInputElement>(null);
   const diagramInstanceRef = useRef<go.Diagram | null>(null);
   const nodePositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const relacionesPendientesRef = useRef<RelacionRemota[]>([]);
   const reconocimientoRef = useRef<SpeechRecognitionLike | null>(null);
   const [unidoAlDiagrama, setUnidoAlDiagrama] = useState(false);
 
@@ -133,6 +143,44 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   // ─── useEffect A: Socket ───────────────────────────────────────────
   // Independiente de GoJS. Registra handlers y conecta el socket.
   useEffect(() => {
+    const agregarRelacionAlModelo = (model: go.GraphLinksModel, relacion: RelacionRemota) => {
+      if (model.findLinkDataForKey(relacion.id)) return true;
+      if (!model.findNodeDataForKey(relacion.origenId) || !model.findNodeDataForKey(relacion.destinoId)) return false;
+      model.addLinkData({
+        key: relacion.id,
+        origenId: relacion.origenId,
+        destinoId: relacion.destinoId,
+        multiplicidadOrigen: relacion.multiplicidadOrigen,
+        multiplicidadDestino: relacion.multiplicidadDestino,
+        multiplicidad: `${relacion.multiplicidadOrigen || ""} → ${relacion.multiplicidadDestino || ""}`,
+        tipo: relacion.tipo,
+      });
+      return true;
+    };
+
+    const procesarRelacionesPendientes = () => {
+      const diagram = diagramInstanceRef.current;
+      if (!diagram) return false;
+      const model = diagram.model as go.GraphLinksModel;
+      const restantes: RelacionRemota[] = [];
+      model.startTransaction("procesar relaciones pendientes");
+      for (const relacion of relacionesPendientesRef.current) {
+        if (!agregarRelacionAlModelo(model, relacion)) restantes.push(relacion);
+      }
+      model.commitTransaction("procesar relaciones pendientes");
+      relacionesPendientesRef.current = restantes;
+      return restantes.length === 0;
+    };
+
+    const reintentarRelacionesPendientes = () => {
+      let intentos = 0;
+      const intentar = () => {
+        if (procesarRelacionesPendientes() || intentos++ > 40) return;
+        setTimeout(intentar, 50);
+      };
+      intentar();
+    };
+
     const onEstado = (data: {
       elementos: { id: string; nombre: string; tipo: string; posicionX: number; posicionY: number; atributos: Atributo[] }[];
       relaciones?: {
@@ -172,18 +220,10 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
         });
         const model = diagram.model as go.GraphLinksModel;
         data.relaciones?.forEach((relation) => {
-          if (model.findLinkDataForKey(relation.id)) return;
-          model.addLinkData({
-            key: relation.id,
-            origenId: relation.origenId,
-            destinoId: relation.destinoId,
-            tipo: relation.tipo,
-            multiplicidadOrigen: relation.multiplicidadOrigen,
-            multiplicidadDestino: relation.multiplicidadDestino,
-            multiplicidad: `${relation.multiplicidadOrigen || ""} → ${relation.multiplicidadDestino || ""}`,
-          });
+          agregarRelacionAlModelo(model, relation);
         });
         diagram.commitTransaction("cargar estado");
+        procesarRelacionesPendientes();
       };
       aplicar();
     };
@@ -212,6 +252,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
         });
         nodePositionsRef.current.set(data.id, { x: data.posicionX, y: data.posicionY });
         diagram.commitTransaction("agregar elemento");
+        procesarRelacionesPendientes();
       };
       aplicar();
     };
@@ -289,30 +330,22 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
       setAtributosNodo((actuales) => actuales.filter((atributo) => atributo.id !== data.atributoId));
     };
 
-    const onRelacionCreada = (data: {
-      id: string;
-      tipo: string;
-      origenId: string;
-      destinoId: string;
-      multiplicidadOrigen: string | null;
-      multiplicidadDestino: string | null;
-    }) => {
+    const onRelacionCreada = (data: RelacionRemota) => {
       const diagram = diagramInstanceRef.current;
-      if (!diagram) return;
+      if (!diagram) {
+        relacionesPendientesRef.current.push(data);
+        reintentarRelacionesPendientes();
+        return;
+      }
       const model = diagram.model as go.GraphLinksModel;
       if (model.findLinkDataForKey(data.id)) return;
-      if (!model.findNodeDataForKey(data.origenId) || !model.findNodeDataForKey(data.destinoId)) return;
       model.startTransaction("crear relación remota");
-      model.addLinkData({
-        key: data.id,
-        origenId: data.origenId,
-        destinoId: data.destinoId,
-        multiplicidadOrigen: data.multiplicidadOrigen,
-        multiplicidadDestino: data.multiplicidadDestino,
-        multiplicidad: `${data.multiplicidadOrigen || ""} → ${data.multiplicidadDestino || ""}`,
-        tipo: data.tipo,
-      });
+      const agregada = agregarRelacionAlModelo(model, data);
       model.commitTransaction("crear relación remota");
+      if (!agregada) {
+        relacionesPendientesRef.current.push(data);
+        reintentarRelacionesPendientes();
+      }
     };
 
     const onRelacionActualizada = (data: {
@@ -487,7 +520,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
             socket.emit("elemento:eliminar", { diagramaId, elementoId });
           }
         },
-      }, new go.Binding("visible", "key")),
+      }, { visible: true }),
       $(go.Shape, "Circle", {
         alignment: go.Spot.Right,
         width: 14,
