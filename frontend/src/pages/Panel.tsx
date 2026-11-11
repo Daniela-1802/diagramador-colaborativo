@@ -1,4 +1,5 @@
 import { Component, ErrorInfo, ReactNode, useState, useEffect } from "react";
+import { apiUrl } from "../api";
 
 interface Diagrama {
   id: string;
@@ -52,7 +53,7 @@ export default function Panel({ usuario, token, onLogout, onAbrirDiagrama }: Pro
   const [error, setError] = useState("");
 
   const cargarDiagramas = async () => {
-    const res = await fetch("/diagramas", {
+    const res = await fetch(apiUrl("/diagramas"), {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (res.ok) setDiagramas(await res.json());
@@ -67,7 +68,7 @@ export default function Panel({ usuario, token, onLogout, onAbrirDiagrama }: Pro
     setCargando(true);
     setError("");
 
-    const res = await fetch("/diagramas", {
+    const res = await fetch(apiUrl("/diagramas"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -143,7 +144,7 @@ export default function Panel({ usuario, token, onLogout, onAbrirDiagrama }: Pro
                                 return;
                               }
 
-                              const respuesta = await fetch(`/diagramas/${d.id}`, {
+                              const respuesta = await fetch(apiUrl(`/diagramas/${d.id}`), {
                                 method: "DELETE",
                                 headers: { Authorization: `Bearer ${token}` },
                               });

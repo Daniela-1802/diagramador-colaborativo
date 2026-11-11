@@ -10,6 +10,7 @@ export interface AccionComando {
     | "agregar_atributo"
     | "cambiar_multiplicidad"
     | "cambiar_tipo_relacion"
+    | "eliminar_relacion"
     | "desconocido"
     | "error_conexion";
   nombre?: string;
@@ -215,6 +216,7 @@ const interpretarConModelo = async (modelo: string, texto: string): Promise<Resu
       accion.accion !== "agregar_atributo" &&
       accion.accion !== "cambiar_multiplicidad" &&
       accion.accion !== "cambiar_tipo_relacion" &&
+      accion.accion !== "eliminar_relacion" &&
       accion.accion !== "desconocido"
     ) {
       accionesValidas.push({ accion: "desconocido" });
@@ -263,6 +265,137 @@ export async function interpretarComando(texto: string, nombresClasesExistentes:
   } catch {
     return { acciones: [{ accion: "error_conexion" }] };
   }
+}
+
+export interface RespuestaChatIA {
+  mensaje: string;
+  acciones: AccionComando[];
+}
+
+export async function generarRespuestaChat(
+  nombreUsuario: string,
+  mensajeUsuario: string,
+  contextoDiagrama: string,
+  historialChat: { autor: string; mensaje: string }[]
+): Promise<RespuestaChatIA> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY no está configurada");
+
+  const historialFormateado = historialChat
+    .map(({ autor, mensaje }) => `${autor}: ${mensaje}`)
+    .join("\n");
+  const texto = [
+    historialFormateado ? `Historial del chat:\n${historialFormateado}` : "",
+    `Mensaje actual de ${nombreUsuario}: ${mensajeUsuario}`,
+  ].filter(Boolean).join("\n\n");
+  const systemInstruction = `1. ROL
+Eres un asistente experto en Ingeniería de Software y diagramación UML.
+Tu trabajo es interpretar el lenguaje natural del usuario y traducirlo a acciones técnicas.
+Estás hablando con ${nombreUsuario}. El estado actual del diagrama es:
+${contextoDiagrama}
+
+2. DICCIONARIO DE SINÓNIMOS
+- "crear", "agregar", "añadir", "poner" o "haz" indican crear_clase o agregar_atributo.
+- "eliminar", "borrar", "quitar", "sacar" o "desconectar" indican eliminar_clase o eliminar_relacion.
+
+3. REGLAS ESTRICTAS DE SALIDA
+- Responde SIEMPRE con un único JSON válido: {"mensaje":"...","acciones":[...]}
+- NUNCA devuelvas texto fuera del JSON.
+- Si el usuario implica una acción UML, ES OBLIGATORIO incluir la acción en el JSON. Si no incluyes la acción, el sistema fallará.
+
+4. EJEMPLOS DE INTERACCIÓN (SÍGUELOS AL PIE DE LA LETRA)
+Usuario: "Hola, ¿cómo estás?" -> {"mensaje": "¡Hola! Soy tu asistente UML. ¿En qué puedo ayudarte hoy?", "acciones": []}
+Usuario: "Borra la clase Silla" -> {"mensaje": "Entendido, he eliminado la clase Silla del diagrama.", "acciones": [{"accion": "eliminar_clase", "nombre": "Silla"}]}
+Usuario: "Desconecta calzado de sintetico" -> {"mensaje": "Claro, he eliminado la relación entre calzado y sintetico.", "acciones": [{"accion": "eliminar_relacion", "origen": "calzado", "destino": "sintetico"}]}
+Usuario: "Crea la clase Mesa" -> {"mensaje": "He creado la clase Mesa.", "acciones": [{"accion": "crear_clase", "nombre": "Mesa"}]}
+Usuario: "Conecta Mesa con Silla" -> {"mensaje": "He creado la relación entre Mesa y Silla.", "acciones": [{"accion": "crear_relacion", "origen": "Mesa", "destino": "Silla", "tipo": "ASOCIACION"}]}
+
+5. LISTA DE ACCIONES VÁLIDAS
+- crear_clase: requiere "nombre".
+- eliminar_clase: requiere "nombre".
+- renombrar_clase: requiere "nombre" y "nuevoNombre".
+- agregar_atributo: requiere "elemento", "atributo" y "tipoDato".
+- crear_relacion: requiere "origen", "destino" y "tipo". "tipo" debe ser
+  "ASOCIACION", "HERENCIA", "COMPOSICION" o "AGREGACION".
+- eliminar_relacion: requiere "origen" y "destino".
+- mover_elemento: requiere "nombre" y "direccion".`;
+  const generativeModel = new GoogleGenerativeAI(apiKey).getGenerativeModel({
+    model: "gemini-3.5-flash-lite",
+    systemInstruction,
+    generationConfig: { responseMimeType: "application/json" },
+  });
+  const esperas = [1000, 2000, 4000];
+
+  const parsearRespuesta = (textoRespuesta: string): RespuestaChatIA => {
+    const respuesta: unknown = JSON.parse(textoRespuesta);
+    if (!respuesta || typeof respuesta !== "object" || Array.isArray(respuesta)) {
+      throw new Error("Gemini devolvió una respuesta de chat inválida");
+    }
+
+    const datos = respuesta as Record<string, unknown>;
+    if (typeof datos.mensaje !== "string" || !Array.isArray(datos.acciones)) {
+      throw new Error("Gemini devolvió una respuesta de chat con formato inválido");
+    }
+
+    const accionesPermitidas = new Set<string>([
+      "crear_clase",
+      "mover_elemento",
+      "eliminar_clase",
+      "renombrar_clase",
+      "crear_relacion",
+      "agregar_atributo",
+      "cambiar_multiplicidad",
+      "cambiar_tipo_relacion",
+      "eliminar_relacion",
+      "desconocido",
+      "error_conexion",
+    ]);
+    const esAccionComando = (accion: unknown): accion is AccionComando["accion"] =>
+      typeof accion === "string" && accionesPermitidas.has(accion);
+    const camposOpcionales: (keyof Omit<AccionComando, "accion">)[] = [
+      "nombre",
+      "direccion",
+      "nuevoNombre",
+      "origen",
+      "destino",
+      "tipo",
+      "multiplicidad",
+      "elemento",
+      "atributo",
+      "tipoDato",
+      "visibilidad",
+      "multiplicidadOrigen",
+      "multiplicidadDestino",
+    ];
+    const acciones = datos.acciones.flatMap((valor): AccionComando[] => {
+      if (!valor || typeof valor !== "object" || Array.isArray(valor)) return [];
+
+      const datosAccion = valor as Record<string, unknown>;
+      if (!esAccionComando(datosAccion.accion)) return [];
+
+      const accion: AccionComando = { accion: datosAccion.accion };
+      camposOpcionales.forEach((campo) => {
+        const valorCampo = datosAccion[campo];
+        if (typeof valorCampo === "string") accion[campo] = valorCampo;
+      });
+      return [accion];
+    });
+
+    return { mensaje: datos.mensaje, acciones };
+  };
+
+  for (let intento = 0; intento < 3; intento += 1) {
+    try {
+      const resultado = await generativeModel.generateContent(texto);
+      return parsearRespuesta(resultado.response.text());
+    } catch (error) {
+      if (!esErrorReintentable(error)) throw error;
+      await espera(esperas[intento]);
+    }
+  }
+
+  const resultado = await generativeModel.generateContent(texto);
+  return parsearRespuesta(resultado.response.text());
 }
 
 export type ResultadoComando = { acciones: AccionComando[] } | AccionComando;

@@ -653,6 +653,42 @@ router.post("/:id/importar-imagen", uploadImagen.single("imagen"), async (req: A
   res.status(200).json({ clasesImportadas: emitidos.elementos.length, relacionesImportadas: emitidos.relaciones.length, errores: [] });
 });
 
+router.get("/:id/chat", async (req: AuthRequest, res: Response): Promise<void> => {
+  const { id } = req.params;
+  const colaboracion = await prisma.colaboracion.findUnique({
+    where: {
+      usuarioId_diagramaId: {
+        usuarioId: req.usuarioId!,
+        diagramaId: id,
+      },
+    },
+  });
+
+  if (!colaboracion) {
+    res.status(403).json({ error: "No tienes acceso a este diagrama" });
+    return;
+  }
+
+  const mensajes = await prisma.mensajeChat.findMany({
+    where: { diagramaId: id },
+    orderBy: { creadoEn: "desc" },
+    take: 50,
+    include: { usuario: { select: { nombre: true } } },
+  });
+
+  res.json(
+    mensajes.reverse().map((mensaje) => ({
+      id: mensaje.id,
+      contenido: mensaje.contenido,
+      esIA: mensaje.esIA,
+      creadoEn: mensaje.creadoEn,
+      usuarioId: mensaje.usuarioId,
+      nombreUsuario: mensaje.esIA ? "IA" : mensaje.usuario.nombre,
+      diagramaId: mensaje.diagramaId,
+    }))
+  );
+});
+
 router.get("/:id", async (req: AuthRequest, res: Response): Promise<void> => {
   const { id } = req.params;
 

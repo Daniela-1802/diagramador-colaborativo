@@ -11,10 +11,17 @@ import { configurarSocket } from "./socket";
 const app = express();
 const httpServer = http.createServer(app);
 const PORT = process.env.PORT || 3000;
+const allowedOrigins = [
+  "https://34.226.213.175.nip.io",
+  "http://localhost:5173",
+  "http://localhost",
+  "https://localhost",
+  "capacitor://localhost",
+];
 
 const io = new Server(httpServer, {
   cors: {
-    origin: "http://localhost:5173",
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
   },
 });
@@ -23,7 +30,7 @@ app.set("io", io);
 
 configurarSocket(io);
 
-app.use(cors());
+app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
 app.use("/auth", authRoutes);

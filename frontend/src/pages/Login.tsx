@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { apiUrl } from "../api";
 
 interface Props {
   onLogin: (token: string, usuario: { id: string; nombre: string; email: string }) => void;
@@ -18,7 +19,7 @@ export default function Login({ onLogin }: Props) {
     setCargando(true);
 
     try {
-      const url = modo === "login" ? "/auth/login" : "/auth/registro";
+      const url = apiUrl(modo === "login" ? "/auth/login" : "/auth/registro");
       const body: Record<string, string> = modo === "login"
         ? { email, contrasena }
         : { nombre, email, contrasena };

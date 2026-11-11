@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as go from "gojs";
 import socket from "../socket";
+import { apiUrl } from "../api";
 
 interface Colaborador {
   usuarioId: string;
@@ -39,6 +40,16 @@ interface Props {
   diagramaId: string;
   token: string;
   onVolver: () => void;
+}
+
+interface MensajeChat {
+  id: string;
+  contenido: string;
+  esIA: boolean;
+  creadoEn: string;
+  usuarioId: string;
+  nombreUsuario: string;
+  diagramaId: string;
 }
 
 interface SpeechRecognitionResultLike {
@@ -93,6 +104,11 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   const [exitoInvitacion, setExitoInvitacion] = useState("");
   const [cargandoInvitacion, setCargandoInvitacion] = useState(false);
   const [textoComando, setTextoComando] = useState("");
+  const [mensajes, setMensajes] = useState<MensajeChat[]>([]);
+  const [textoChat, setTextoChat] = useState("");
+  const [invocarIA, setInvocarIA] = useState(true);
+  const [notificacionesActivas, setNotificacionesActivas] = useState(false);
+  const [errorChat, setErrorChat] = useState("");
   const [escuchando, setEscuchando] = useState(false);
   const [soportaVoz, setSoportaVoz] = useState(false);
   const [errorComando, setErrorComando] = useState("");
@@ -105,19 +121,19 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   const [nombreAtributo, setNombreAtributo] = useState("");
   const [tipoDatoAtributo, setTipoDatoAtributo] = useState("");
   const [visibilidadAtributo, setVisibilidadAtributo] = useState("+");
-  const [cargandoImportacionImagen, setCargandoImportacionImagen] = useState(false);
 
   const diagramContainerRef = useRef<HTMLDivElement>(null);
   const archivoXmiRef = useRef<HTMLInputElement>(null);
-  const archivoImagenRef = useRef<HTMLInputElement>(null);
   const diagramInstanceRef = useRef<go.Diagram | null>(null);
   const nodePositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const relacionesPendientesRef = useRef<RelacionRemota[]>([]);
   const reconocimientoRef = useRef<SpeechRecognitionLike | null>(null);
+  const mensajesChatRef = useRef<HTMLDivElement>(null);
+  const notificacionesActivasRef = useRef(false);
   const [unidoAlDiagrama, setUnidoAlDiagrama] = useState(false);
 
   const cargarDiagrama = async () => {
-    const res = await fetch(`/diagramas/${diagramaId}`, {
+    const res = await fetch(apiUrl(`/diagramas/${diagramaId}`), {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) {
@@ -129,7 +145,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   };
 
   const cargarColaboradores = async () => {
-    const res = await fetch(`/diagramas/${diagramaId}/colaboradores`, {
+    const res = await fetch(apiUrl(`/diagramas/${diagramaId}/colaboradores`), {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (res.ok) {
@@ -141,6 +157,50 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     cargarDiagrama();
     cargarColaboradores();
   }, [diagramaId, token]);
+
+  useEffect(() => {
+    let activo = true;
+    const cargarHistorialChat = async () => {
+      try {
+        const res = await fetch(apiUrl(`/diagramas/${diagramaId}/chat`), {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(data.error || "No se pudo cargar el historial del chat");
+        }
+        const historial: MensajeChat[] = await res.json();
+        if (activo) {
+          setMensajes((actuales) => {
+            const porId = new Map<string, MensajeChat>();
+            actuales.forEach((mensaje) => porId.set(mensaje.id, mensaje));
+            historial.forEach((mensaje) => porId.set(mensaje.id, mensaje));
+            return [...porId.values()].sort(
+              (a, b) => new Date(a.creadoEn).getTime() - new Date(b.creadoEn).getTime()
+            );
+          });
+        }
+      } catch (error) {
+        if (activo) {
+          setErrorChat(error instanceof Error ? error.message : "No se pudo cargar el historial del chat");
+        }
+      }
+    };
+
+    void cargarHistorialChat();
+    return () => {
+      activo = false;
+    };
+  }, [diagramaId, token]);
+
+  useEffect(() => {
+    const lista = mensajesChatRef.current;
+    if (lista) lista.scrollTop = lista.scrollHeight;
+  }, [mensajes]);
+
+  useEffect(() => {
+    notificacionesActivasRef.current = notificacionesActivas;
+  }, [notificacionesActivas]);
 
   // ─── useEffect A: Socket ───────────────────────────────────────────
   // Independiente de GoJS. Registra handlers y conecta el socket.
@@ -369,11 +429,17 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
       model.commitTransaction("actualizar relación remota");
     };
 
-    const onRelacionEliminada = (data: { relacionId: string }) => {
+    const onRelacionEliminada = (data: { id?: string; relacionId?: string }) => {
+      const relacionId = data.id || data.relacionId;
+      if (!relacionId) return;
+
+      relacionesPendientesRef.current = relacionesPendientesRef.current.filter(
+        (relacion) => relacion.id !== relacionId
+      );
       const diagram = diagramInstanceRef.current;
       if (!diagram) return;
       const model = diagram.model as go.GraphLinksModel;
-      const linkData = model.findLinkDataForKey(data.relacionId);
+      const linkData = model.findLinkDataForKey(relacionId);
       if (!linkData) return;
       model.startTransaction("eliminar relación remota");
       model.removeLinkData(linkData);
@@ -383,6 +449,27 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     const onError = (data: { mensaje: string }) => {
       console.error("[onError]", data.mensaje);
       setErrorComando(data.mensaje);
+      setErrorChat(data.mensaje);
+    };
+
+    const onMensajeChat = (mensaje: MensajeChat) => {
+      setMensajes((actuales) => {
+        if (actuales.some((actual) => actual.id === mensaje.id)) return actuales;
+        return [...actuales, mensaje].sort(
+          (a, b) => new Date(a.creadoEn).getTime() - new Date(b.creadoEn).getTime()
+        );
+      });
+
+      if (
+        notificacionesActivasRef.current &&
+        document.hidden &&
+        "Notification" in window &&
+        Notification.permission === "granted"
+      ) {
+        new Notification(mensaje.esIA ? "IA - Asesor" : mensaje.nombreUsuario, {
+          body: mensaje.contenido,
+        });
+      }
     };
 
     const onConnect = () => {
@@ -401,6 +488,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     socket.on("relacion:eliminada", onRelacionEliminada);
     socket.on("relacion:actualizada", onRelacionActualizada);
     socket.on("error", onError);
+    socket.on("chat:mensaje-nuevo", onMensajeChat);
     socket.on("connect", onConnect);
 
     if (socket.connected) {
@@ -422,6 +510,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
       socket.off("relacion:eliminada", onRelacionEliminada);
       socket.off("relacion:actualizada", onRelacionActualizada);
       socket.off("error", onError);
+      socket.off("chat:mensaje-nuevo", onMensajeChat);
       socket.off("connect", onConnect);
     };
   }, [diagramaId, token]);
@@ -684,9 +773,9 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
         diagramContainerRef.current.removeEventListener("mouseup", handleMouseUp);
       }
       try {
-        if (diagram && typeof diagram.dispose === "function") {
+        if (diagram && typeof (diagram as any).dispose === "function") {
           diagram.div = null;
-          diagram.dispose();
+          (diagram as any).dispose();
         }
       } catch (e) {
         console.warn("[GoJS cleanup] Error al disponer diagrama:", e);
@@ -725,6 +814,34 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     enviarComando(textoComando);
   };
 
+  const enviarMensajeChat = (e: React.FormEvent | React.KeyboardEvent) => {
+    e.preventDefault();
+    const contenido = textoChat.trim();
+    if (!contenido || !unidoAlDiagrama) return;
+
+    setErrorChat("");
+    socket.emit("chat:enviar", { diagramaId, contenido, invocarIA });
+    setTextoChat("");
+  };
+
+  const activarNotificaciones = async () => {
+    if (!("Notification" in window)) {
+      setErrorChat("Este navegador no admite notificaciones.");
+      return;
+    }
+
+    const permiso = Notification.permission === "granted"
+      ? "granted"
+      : await Notification.requestPermission();
+    if (permiso === "granted") {
+      setNotificacionesActivas(true);
+      setErrorChat("");
+    } else {
+      setNotificacionesActivas(false);
+      setErrorChat("No se concedió permiso para mostrar notificaciones.");
+    }
+  };
+
   const guardarRelacion = () => {
     if (!relacionSeleccionada) return;
     socket.emit("relacion:actualizar", {
@@ -760,7 +877,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
   };
 
   const handleExportarXMI = async () => {
-    const res = await fetch(`/diagramas/${diagramaId}/exportar-xmi`, {
+    const res = await fetch(apiUrl(`/diagramas/${diagramaId}/exportar-xmi`), {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) {
@@ -771,7 +888,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `diagrama-${diagrama.titulo.replace(/\s+/g, "-")}.xmi`;
+    a.download = `diagrama-${diagrama?.titulo.replace(/\s+/g, "-") ?? "diagrama"}.xmi`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -785,7 +902,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
 
     const formData = new FormData();
     formData.append("archivo", archivo);
-    const res = await fetch(`/diagramas/${diagramaId}/importar-xmi`, {
+    const res = await fetch(apiUrl(`/diagramas/${diagramaId}/importar-xmi`), {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },
       body: formData,
@@ -797,34 +914,6 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     }
     alert(`Importadas ${data.clasesImportadas} clases y ${data.relacionesImportadas} relaciones`);
     socket.emit("diagrama:unirse", { diagramaId, token });
-  };
-
-  const handleImportarImagen = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const imagen = event.target.files?.[0];
-    event.target.value = "";
-    if (!imagen) return;
-
-    setCargandoImportacionImagen(true);
-    try {
-      const formData = new FormData();
-      formData.append("imagen", imagen);
-      const res = await fetch(`/diagramas/${diagramaId}/importar-imagen`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: formData,
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.error || "Error al importar la imagen");
-        return;
-      }
-      alert(`Importadas ${data.clasesImportadas} clases y ${data.relacionesImportadas} relaciones`);
-      socket.emit("diagrama:unirse", { diagramaId, token });
-    } catch {
-      alert("No se pudo conectar con el servidor para importar la imagen");
-    } finally {
-      setCargandoImportacionImagen(false);
-    }
   };
 
   const iniciarEscucha = () => {
@@ -863,7 +952,7 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
     setErrorInvitacion("");
     setExitoInvitacion("");
 
-    const res = await fetch(`/diagramas/${diagramaId}/invitar`, {
+    const res = await fetch(apiUrl(`/diagramas/${diagramaId}/invitar`), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -932,13 +1021,6 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           <button style={styles.botonExportar} onClick={() => archivoXmiRef.current?.click()}>
             Importar XMI
           </button>
-          <button
-            style={styles.botonExportar}
-            onClick={() => archivoImagenRef.current?.click()}
-            disabled={cargandoImportacionImagen}
-          >
-            {cargandoImportacionImagen ? "Analizando imagen..." : "Importar imagen"}
-          </button>
           <input
             ref={archivoXmiRef}
             type="file"
@@ -946,16 +1028,32 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
             hidden
             onChange={handleImportarXMI}
           />
-          <input
-            ref={archivoImagenRef}
-            type="file"
-            accept="image/*"
-            hidden
-            onChange={handleImportarImagen}
-          />
         </div>
       </header>
       <main style={styles.main}>
+        <style>{`
+          .diagrama-workspace {
+            flex-direction: row;
+          }
+
+          @media (max-width: 768px) {
+            .diagrama-workspace {
+              flex-direction: column !important;
+            }
+
+            .diagrama-canvas-section {
+              flex: 0 0 100% !important;
+              width: 100%;
+            }
+
+            .diagrama-chat-panel {
+              flex: 0 0 auto !important;
+              width: 100%;
+              height: 50vh !important;
+              min-height: 320px;
+            }
+          }
+        `}</style>
         <section style={styles.seccion}>
           <div style={styles.filaTitulo}>
             <h2 style={styles.seccionTitulo}>Colaboradores</h2>
@@ -976,7 +1074,8 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
           </ul>
         </section>
 
-        <section style={styles.seccion}>
+        <div className="diagrama-workspace" style={styles.workspaceLayout}>
+        <section className="diagrama-canvas-section" style={styles.canvasSection}>
           <div style={styles.filaTitulo}>
             <h2 style={styles.seccionTitulo}>Canvas</h2>
             <button
@@ -1025,6 +1124,93 @@ export default function DiagramaDetalle({ diagramaId, token, onVolver }: Props) 
             }}
           />
         </section>
+        <section className="diagrama-chat-panel" style={styles.chatPanel}>
+          <header style={styles.chatHeader}>
+            <div>
+              <h2 style={styles.chatTitle}>Chat Colaborativo</h2>
+              <span style={styles.chatSubtitle}>Conversación del equipo</span>
+            </div>
+            <button
+              type="button"
+              style={{
+                ...styles.notificationButton,
+                backgroundColor: notificacionesActivas ? "#e8f5e9" : "#f1edfa",
+                color: notificacionesActivas ? "#2e7d32" : "#6941c6",
+              }}
+              onClick={activarNotificaciones}
+            >
+              {notificacionesActivas ? "Notificaciones activas" : "Activar notificaciones"}
+            </button>
+          </header>
+          <div
+            ref={mensajesChatRef}
+            style={styles.chatMessages}
+            aria-live="polite"
+            aria-label="Mensajes del chat"
+          >
+            {mensajes.length === 0 && (
+              <p style={styles.chatEmpty}>Aún no hay mensajes. ¡Inicia la conversación!</p>
+            )}
+            {mensajes.map((mensaje) => (
+              <article
+                key={mensaje.id}
+                style={{
+                  ...styles.chatBubble,
+                  alignSelf: mensaje.esIA ? "flex-start" : "flex-end",
+                  backgroundColor: mensaje.esIA ? "#f1edfa" : "#e7f5ef",
+                }}
+              >
+                <div style={styles.chatMessageMeta}>
+                  <strong style={{ color: mensaje.esIA ? "#6941c6" : "#216e4e" }}>
+                    {mensaje.esIA ? "IA - Asesor" : mensaje.nombreUsuario}
+                  </strong>
+                  <time style={styles.chatTime} dateTime={mensaje.creadoEn}>
+                    {new Date(mensaje.creadoEn).toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </time>
+                </div>
+                <p style={styles.chatMessageText}>{mensaje.contenido}</p>
+              </article>
+            ))}
+          </div>
+          {errorChat && <p style={styles.chatError}>{errorChat}</p>}
+          <form style={styles.chatForm} onSubmit={enviarMensajeChat}>
+            <label style={styles.chatCheckbox}>
+              <input
+                type="checkbox"
+                checked={invocarIA}
+                onChange={(event) => setInvocarIA(event.target.checked)}
+              />
+              Preguntar a la IA
+            </label>
+            <div style={styles.chatInputRow}>
+              <textarea
+                style={styles.chatInput}
+                value={textoChat}
+                onChange={(event) => setTextoChat(event.target.value)}
+                placeholder="Escribe un mensaje..."
+                rows={2}
+                disabled={!unidoAlDiagrama}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    enviarMensajeChat(event);
+                  }
+                }}
+              />
+              <button
+                style={styles.chatSendButton}
+                type="submit"
+                disabled={!unidoAlDiagrama || !textoChat.trim()}
+              >
+                Enviar
+              </button>
+            </div>
+          </form>
+        </section>
+        </div>
       </main>
 
       {mostrarModal && (
@@ -1216,8 +1402,55 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: "4px", border: "1px solid rgba(255,255,255,0.3)", cursor: "pointer",
     fontSize: "0.75rem", fontWeight: 600, marginLeft: "0.5rem",
   },
-  main: { padding: "2rem", maxWidth: "1000px", margin: "0 auto" },
+  main: { padding: "2rem", maxWidth: "1600px", margin: "0 auto", boxSizing: "border-box" },
   seccion: { marginBottom: "2rem" },
+  workspaceLayout: {
+    display: "flex", flexDirection: "row", flexWrap: "wrap", alignItems: "stretch", gap: "1.25rem",
+  },
+  canvasSection: { flex: "1 1 620px", minWidth: 0, marginBottom: "2rem" },
+  chatPanel: {
+    flex: "0 1 340px", minWidth: "280px", height: "600px", boxSizing: "border-box",
+    display: "flex", flexDirection: "column", backgroundColor: "white", borderRadius: "10px",
+    border: "1px solid #e5e7eb", boxShadow: "0 4px 16px rgba(26,26,46,0.08)",
+    overflow: "hidden", marginBottom: "2rem",
+  },
+  chatHeader: {
+    display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.5rem",
+    padding: "1rem", backgroundColor: "#1a1a2e", color: "white",
+  },
+  chatTitle: { margin: 0, fontSize: "1.2rem" },
+  chatSubtitle: { fontSize: "0.75rem", color: "#c5c6d0" },
+  notificationButton: {
+    border: "none", borderRadius: "6px", padding: "0.4rem 0.55rem", fontSize: "0.68rem",
+    fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
+  },
+  chatMessages: {
+    flex: 1, display: "flex", flexDirection: "column", gap: "0.6rem",
+    padding: "1rem", overflowY: "auto", backgroundColor: "#f7f8fb",
+  },
+  chatEmpty: { color: "#818797", fontSize: "1rem", textAlign: "center", margin: "auto 0" },
+  chatBubble: {
+    maxWidth: "88%", padding: "0.65rem 0.8rem", borderRadius: "10px",
+    boxShadow: "0 1px 2px rgba(0,0,0,0.06)", overflowWrap: "anywhere",
+  },
+  chatMessageMeta: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem" },
+  chatTime: { color: "#7a7f8d", fontSize: "0.8rem", whiteSpace: "nowrap" },
+  chatMessageText: { margin: "0.35rem 0 0", color: "#25283a", fontSize: "1.05rem", whiteSpace: "pre-wrap" },
+  chatError: { margin: "0", padding: "0.45rem 0.8rem", backgroundColor: "#fff1f0", color: "#b42318", fontSize: "0.75rem" },
+  chatForm: { padding: "0.8rem", borderTop: "1px solid #e8e9ee", backgroundColor: "white" },
+  chatCheckbox: {
+    display: "flex", alignItems: "center", gap: "0.4rem", marginBottom: "0.55rem",
+    color: "#535767", fontSize: "0.9rem", cursor: "pointer",
+  },
+  chatInputRow: { display: "flex", alignItems: "stretch", gap: "0.5rem" },
+  chatInput: {
+    flex: 1, resize: "none", padding: "0.65rem", border: "1px solid #d9dce5",
+    borderRadius: "7px", font: "inherit", fontSize: "1rem", outlineColor: "#6941c6",
+  },
+  chatSendButton: {
+    padding: "0.5rem 0.8rem", backgroundColor: "#4361ee", color: "white", border: "none",
+    borderRadius: "7px", cursor: "pointer", fontWeight: 600,
+  },
   filaTitulo: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" },
   seccionTitulo: { fontSize: "1.1rem", color: "#1a1a2e", margin: 0 },
   botonInvitar: {

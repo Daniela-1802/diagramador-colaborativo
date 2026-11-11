@@ -1,7 +1,7 @@
 import { Server, Socket } from "socket.io";
 import jwt from "jsonwebtoken";
 import prisma from "./lib/prisma";
-import { AccionComando, interpretarComando, ResultadoComando } from "./gemini";
+import { AccionComando, generarRespuestaChat, interpretarComando, ResultadoComando } from "./gemini";
 
 interface SocketData {
   usuarioId?: string;
@@ -158,6 +158,329 @@ export function configurarSocket(io: Server) {
           exito,
         },
       });
+    };
+
+    const ejecutarAccionesIA = async (
+      diagramaId: string,
+      usuarioId: string,
+      acciones: AccionComando[],
+      socket: any
+    ): Promise<{ exitosas: number; fallidas: number; errores: string[] }> => {
+      let exitosas = 0;
+      let fallidas = 0;
+      const errores: string[] = [];
+
+      for (const accion of acciones) {
+        let exito = false;
+
+        try {
+          if (accion.accion === "crear_clase" && accion.nombre) {
+            await crearElemento(diagramaId, usuarioId, {
+              nombre: accion.nombre,
+              tipo: "CLASE",
+              posicionX: 100,
+              posicionY: 100,
+            });
+            exito = true;
+          } else if (accion.accion === "mover_elemento" && accion.nombre) {
+            const elemento = await prisma.elementoDiagrama.findFirst({
+              where: {
+                diagramaId,
+                nombre: { equals: accion.nombre, mode: "insensitive" },
+              },
+            });
+
+            if (!elemento) {
+              socket.emit("error", { mensaje: "No encontré ninguna clase con ese nombre" });
+            } else {
+              const desplazamientos: Record<string, { x: number; y: number }> = {
+                arriba: { x: 0, y: -50 },
+                abajo: { x: 0, y: 50 },
+                izquierda: { x: -50, y: 0 },
+                derecha: { x: 50, y: 0 },
+              };
+              const desplazamiento = accion.direccion
+                ? desplazamientos[accion.direccion.toLowerCase()]
+                : undefined;
+
+              if (!desplazamiento) {
+                socket.emit("error", { mensaje: "No entendí ese comando, intenta reformularlo" });
+              } else {
+                await moverElemento(diagramaId, usuarioId, {
+                  elementoId: elemento.id,
+                  posicionX: elemento.posicionX + desplazamiento.x,
+                  posicionY: elemento.posicionY + desplazamiento.y,
+                }, true);
+                exito = true;
+              }
+            }
+          } else if (accion.accion === "eliminar_clase" && accion.nombre) {
+            const elemento = await prisma.elementoDiagrama.findFirst({
+              where: {
+                diagramaId,
+                nombre: { equals: accion.nombre, mode: "insensitive" },
+              },
+            });
+
+            if (!elemento) {
+              socket.emit("error", { mensaje: "No encontré ninguna clase con ese nombre" });
+            } else {
+              exito = Boolean(await eliminarElemento(diagramaId, usuarioId, elemento.id));
+            }
+          } else if (accion.accion === "renombrar_clase" && accion.nombre && accion.nuevoNombre) {
+            const elemento = await prisma.elementoDiagrama.findFirst({
+              where: {
+                diagramaId,
+                nombre: { equals: accion.nombre, mode: "insensitive" },
+              },
+            });
+
+            if (!elemento) {
+              socket.emit("error", { mensaje: "No encontré ninguna clase con ese nombre" });
+            } else {
+              exito = Boolean(await renombrarElemento(diagramaId, usuarioId, elemento.id, accion.nuevoNombre));
+            }
+          } else if (
+            accion.accion === "agregar_atributo" &&
+            accion.elemento &&
+            accion.atributo &&
+            accion.tipoDato
+          ) {
+            const elemento = await prisma.elementoDiagrama.findFirst({
+              where: { diagramaId, nombre: { equals: accion.elemento, mode: "insensitive" } },
+            });
+
+            if (!elemento) {
+              socket.emit("error", { mensaje: "No encontré la clase indicada para agregar el atributo" });
+            } else {
+              const atributo = await prisma.atributo.create({
+                data: {
+                  elementoDiagramaId: elemento.id,
+                  nombre: accion.atributo,
+                  tipoDato: accion.tipoDato,
+                  visibilidad: accion.visibilidad || "+",
+                },
+                select: { id: true, nombre: true, tipoDato: true, visibilidad: true },
+              });
+              await prisma.registroSesion.create({
+                data: {
+                  usuarioId,
+                  accion: `Creó atributo "${atributo.nombre}" en elemento ${elemento.nombre}`,
+                },
+              });
+              io.to(`diagrama:${diagramaId}`).emit("atributo:creado", {
+                id: atributo.id,
+                elementoId: elemento.id,
+                nombre: atributo.nombre,
+                tipoDato: atributo.tipoDato,
+                visibilidad: atributo.visibilidad,
+              });
+              exito = true;
+            }
+          } else if (
+            accion.accion === "cambiar_multiplicidad" &&
+            accion.origen &&
+            accion.destino &&
+            accion.multiplicidadOrigen &&
+            accion.multiplicidadDestino
+          ) {
+            const [origen, destino] = await Promise.all([
+              prisma.elementoDiagrama.findFirst({
+                where: { diagramaId, nombre: { equals: accion.origen, mode: "insensitive" } },
+              }),
+              prisma.elementoDiagrama.findFirst({
+                where: { diagramaId, nombre: { equals: accion.destino, mode: "insensitive" } },
+              }),
+            ]);
+            const relacion = origen && destino
+              ? await prisma.relacionUML.findFirst({
+                  where: {
+                    OR: [
+                      { origenId: origen.id, destinoId: destino.id },
+                      { origenId: destino.id, destinoId: origen.id },
+                    ],
+                  },
+                })
+              : null;
+
+            if (!relacion) {
+              socket.emit("error", { mensaje: "No encontré la relación indicada" });
+            } else {
+              const actualizada = await prisma.relacionUML.update({
+                where: { id: relacion.id },
+                data: {
+                  multiplicidadOrigen: accion.multiplicidadOrigen,
+                  multiplicidadDestino: accion.multiplicidadDestino,
+                },
+              });
+              io.to(`diagrama:${diagramaId}`).emit("relacion:actualizada", {
+                relacionId: actualizada.id,
+                tipo: actualizada.tipo,
+                multiplicidadOrigen: actualizada.multiplicidadOrigen,
+                multiplicidadDestino: actualizada.multiplicidadDestino,
+              });
+              exito = true;
+            }
+          } else if (
+            accion.accion === "crear_relacion" &&
+            accion.origen &&
+            accion.destino
+          ) {
+            const [origen, destino] = await Promise.all([
+              prisma.elementoDiagrama.findFirst({
+                where: { diagramaId, nombre: { equals: accion.origen, mode: "insensitive" } },
+              }),
+              prisma.elementoDiagrama.findFirst({
+                where: { diagramaId, nombre: { equals: accion.destino, mode: "insensitive" } },
+              }),
+            ]);
+
+            if (!origen || !destino) {
+              socket.emit("error", { mensaje: "No encontré las clases indicadas para crear la relación" });
+            } else {
+              const tipoNormalizado = (accion.tipo || "ASOCIACION").toUpperCase();
+              const multiplicidadOrigen = accion.multiplicidadOrigen || "1..*";
+              const multiplicidadDestino = accion.multiplicidadDestino || "1..*";
+              const relacion = await prisma.relacionUML.create({
+                data: {
+                  tipo: tipoNormalizado,
+                  multiplicidadOrigen,
+                  multiplicidadDestino,
+                  origenId: origen.id,
+                  destinoId: destino.id,
+                },
+              });
+              await prisma.registroSesion.create({
+                data: {
+                  usuarioId,
+                  accion: `Creó relación ${origen.nombre} → ${destino.nombre}`,
+                },
+              });
+              io.to(`diagrama:${diagramaId}`).emit("relacion:creada", {
+                id: relacion.id,
+                origenId: relacion.origenId,
+                destinoId: relacion.destinoId,
+                tipo: relacion.tipo,
+                multiplicidadOrigen: relacion.multiplicidadOrigen,
+                multiplicidadDestino: relacion.multiplicidadDestino,
+              });
+              exito = true;
+            }
+          } else if (
+            accion.accion === "eliminar_relacion" &&
+            accion.origen &&
+            accion.destino
+          ) {
+            const [origen, destino] = await Promise.all([
+              prisma.elementoDiagrama.findFirst({
+                where: { diagramaId, nombre: { equals: accion.origen, mode: "insensitive" } },
+              }),
+              prisma.elementoDiagrama.findFirst({
+                where: { diagramaId, nombre: { equals: accion.destino, mode: "insensitive" } },
+              }),
+            ]);
+            const relacion = origen && destino
+              ? await prisma.relacionUML.findFirst({
+                  where: {
+                    OR: [
+                      { origenId: origen.id, destinoId: destino.id },
+                      { origenId: destino.id, destinoId: origen.id },
+                    ],
+                  },
+                })
+              : null;
+
+            if (!relacion) {
+              socket.emit("error", { mensaje: "No encontré una relación entre esas clases" });
+            } else {
+              await prisma.relacionUML.delete({ where: { id: relacion.id } });
+              await prisma.registroSesion.create({
+                data: {
+                  usuarioId,
+                  accion: `Eliminó relación entre ${accion.origen} y ${accion.destino}`,
+                },
+              });
+              io.to(`diagrama:${diagramaId}`).emit("relacion:eliminada", {
+                relacionId: relacion.id,
+              });
+              exito = true;
+            }
+          } else if (
+            accion.accion === "cambiar_tipo_relacion" &&
+            accion.origen &&
+            accion.destino &&
+            accion.tipo
+          ) {
+            const [origen, destino] = await Promise.all([
+              prisma.elementoDiagrama.findFirst({
+                where: { diagramaId, nombre: { equals: accion.origen, mode: "insensitive" } },
+              }),
+              prisma.elementoDiagrama.findFirst({
+                where: { diagramaId, nombre: { equals: accion.destino, mode: "insensitive" } },
+              }),
+            ]);
+
+            const relacion = origen && destino
+              ? await prisma.relacionUML.findFirst({
+                  where: {
+                    OR: [
+                      { origenId: origen.id, destinoId: destino.id },
+                      { origenId: destino.id, destinoId: origen.id },
+                    ],
+                  },
+                })
+              : null;
+
+            if (!relacion) {
+              socket.emit("error", {
+                mensaje: `No encontré una relación entre "${accion.origen}" y "${accion.destino}"`,
+              });
+            } else {
+              const actualizada = await prisma.relacionUML.update({
+                where: { id: relacion.id },
+                data: { tipo: accion.tipo },
+                select: {
+                  id: true,
+                  tipo: true,
+                  multiplicidadOrigen: true,
+                  multiplicidadDestino: true,
+                },
+              });
+              await prisma.registroSesion.create({
+                data: {
+                  usuarioId,
+                  accion: `Cambió el tipo de relación ${relacion.id} a ${actualizada.tipo}`,
+                },
+              });
+              io.to(`diagrama:${diagramaId}`).emit("relacion:actualizada", {
+                relacionId: actualizada.id,
+                tipo: actualizada.tipo,
+                multiplicidadOrigen: actualizada.multiplicidadOrigen,
+                multiplicidadDestino: actualizada.multiplicidadDestino,
+              });
+              exito = true;
+            }
+          } else if (accion.accion === "desconocido") {
+            socket.emit("error", { mensaje: "No entendí ese comando, intenta reformularlo" });
+          } else {
+            socket.emit("error", { mensaje: "No entendí ese comando, intenta reformularlo" });
+          }
+
+          if (accion.accion === "error_conexion") {
+            socket.emit("error", { mensaje: "No se pudo conectar con el servicio de IA, intenta de nuevo en unos segundos" });
+          }
+          if (exito) {
+            exitosas++;
+          } else {
+            fallidas++;
+          }
+        } catch (error) {
+          fallidas++;
+          errores.push(`Error en "${accion.accion}": ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
+      return { exitosas, fallidas, errores };
     };
 
     socket.on("diagrama:unirse", async (payload: { diagramaId: string; token: string }) => {
@@ -648,7 +971,6 @@ export function configurarSocket(io: Server) {
 
       let resultado: AccionComando = { accion: "error_conexion" };
       let resultadoCompleto: ResultadoComando = { acciones: [resultado] };
-      let exito = false;
       let exitosas = 0;
       let fallidas = 0;
       const errores: string[] = [];
@@ -663,279 +985,10 @@ export function configurarSocket(io: Server) {
         const acciones: AccionComando[] = "acciones" in resultadoCompleto && Array.isArray(resultadoCompleto.acciones)
           ? resultadoCompleto.acciones
           : [resultadoCompleto as AccionComando];
-
-        for (const accion of acciones) {
-          resultado = accion;
-          exito = false;
-
-          try {
-
-        if (resultado.accion === "crear_clase" && resultado.nombre) {
-          await crearElemento(diagramaId, usuarioId, {
-            nombre: resultado.nombre,
-            tipo: "CLASE",
-            posicionX: 100,
-            posicionY: 100,
-          });
-          exito = true;
-        } else if (resultado.accion === "mover_elemento" && resultado.nombre) {
-          const elemento = await prisma.elementoDiagrama.findFirst({
-            where: {
-              diagramaId,
-              nombre: { equals: resultado.nombre, mode: "insensitive" },
-            },
-          });
-
-          if (!elemento) {
-            socket.emit("error", { mensaje: "No encontré ninguna clase con ese nombre" });
-          } else {
-            const desplazamientos: Record<string, { x: number; y: number }> = {
-              arriba: { x: 0, y: -50 },
-              abajo: { x: 0, y: 50 },
-              izquierda: { x: -50, y: 0 },
-              derecha: { x: 50, y: 0 },
-            };
-            const desplazamiento = resultado.direccion ? desplazamientos[resultado.direccion.toLowerCase()] : undefined;
-
-            if (!desplazamiento) {
-              resultado = { accion: "desconocido" };
-              socket.emit("error", { mensaje: "No entendí ese comando, intenta reformularlo" });
-            } else {
-              await moverElemento(diagramaId, usuarioId, {
-                elementoId: elemento.id,
-                posicionX: elemento.posicionX + desplazamiento.x,
-                posicionY: elemento.posicionY + desplazamiento.y,
-              }, true);
-              exito = true;
-            }
-          }
-        } else if (resultado.accion === "eliminar_clase" && resultado.nombre) {
-          const elemento = await prisma.elementoDiagrama.findFirst({
-            where: {
-              diagramaId,
-              nombre: { equals: resultado.nombre, mode: "insensitive" },
-            },
-          });
-
-          if (!elemento) {
-            socket.emit("error", { mensaje: "No encontré ninguna clase con ese nombre" });
-          } else {
-            exito = Boolean(await eliminarElemento(diagramaId, usuarioId, elemento.id));
-          }
-        } else if (resultado.accion === "renombrar_clase" && resultado.nombre && resultado.nuevoNombre) {
-          const elemento = await prisma.elementoDiagrama.findFirst({
-            where: {
-              diagramaId,
-              nombre: { equals: resultado.nombre, mode: "insensitive" },
-            },
-          });
-
-          if (!elemento) {
-            socket.emit("error", { mensaje: "No encontré ninguna clase con ese nombre" });
-          } else {
-            exito = Boolean(await renombrarElemento(diagramaId, usuarioId, elemento.id, resultado.nuevoNombre));
-          }
-        } else if (
-          resultado.accion === "agregar_atributo" &&
-          resultado.elemento &&
-          resultado.atributo &&
-          resultado.tipoDato
-        ) {
-          const elemento = await prisma.elementoDiagrama.findFirst({
-            where: { diagramaId, nombre: { equals: resultado.elemento, mode: "insensitive" } },
-          });
-
-          if (!elemento) {
-            socket.emit("error", { mensaje: "No encontré la clase indicada para agregar el atributo" });
-          } else {
-            const atributo = await prisma.atributo.create({
-              data: {
-                elementoDiagramaId: elemento.id,
-                nombre: resultado.atributo,
-                tipoDato: resultado.tipoDato,
-                visibilidad: resultado.visibilidad || "+",
-              },
-              select: { id: true, nombre: true, tipoDato: true, visibilidad: true },
-            });
-            await prisma.registroSesion.create({
-              data: {
-                usuarioId,
-                accion: `Creó atributo "${atributo.nombre}" en elemento ${elemento.nombre}`,
-              },
-            });
-            io.to(`diagrama:${diagramaId}`).emit("atributo:creado", {
-              id: atributo.id,
-              elementoId: elemento.id,
-              nombre: atributo.nombre,
-              tipoDato: atributo.tipoDato,
-              visibilidad: atributo.visibilidad,
-            });
-            exito = true;
-          }
-        } else if (
-          resultado.accion === "cambiar_multiplicidad" &&
-          resultado.origen &&
-          resultado.destino &&
-          resultado.multiplicidadOrigen &&
-          resultado.multiplicidadDestino
-        ) {
-          const [origen, destino] = await Promise.all([
-            prisma.elementoDiagrama.findFirst({
-              where: { diagramaId, nombre: { equals: resultado.origen, mode: "insensitive" } },
-            }),
-            prisma.elementoDiagrama.findFirst({
-              where: { diagramaId, nombre: { equals: resultado.destino, mode: "insensitive" } },
-            }),
-          ]);
-          const relacion = origen && destino
-            ? await prisma.relacionUML.findFirst({
-                where: {
-                  OR: [
-                    { origenId: origen.id, destinoId: destino.id },
-                    { origenId: destino.id, destinoId: origen.id },
-                  ],
-                },
-              })
-            : null;
-
-          if (!relacion) {
-            socket.emit("error", { mensaje: "No encontré la relación indicada" });
-          } else {
-            const actualizada = await prisma.relacionUML.update({
-              where: { id: relacion.id },
-              data: {
-                multiplicidadOrigen: resultado.multiplicidadOrigen,
-                multiplicidadDestino: resultado.multiplicidadDestino,
-              },
-            });
-            io.to(`diagrama:${diagramaId}`).emit("relacion:actualizada", {
-              relacionId: actualizada.id,
-              tipo: actualizada.tipo,
-              multiplicidadOrigen: actualizada.multiplicidadOrigen,
-              multiplicidadDestino: actualizada.multiplicidadDestino,
-            });
-            exito = true;
-          }
-        } else if (
-          resultado.accion === "crear_relacion" &&
-          resultado.origen &&
-          resultado.destino
-        ) {
-          const [origen, destino] = await Promise.all([
-            prisma.elementoDiagrama.findFirst({
-              where: { diagramaId, nombre: { equals: resultado.origen, mode: "insensitive" } },
-            }),
-            prisma.elementoDiagrama.findFirst({
-              where: { diagramaId, nombre: { equals: resultado.destino, mode: "insensitive" } },
-            }),
-          ]);
-
-          if (!origen || !destino) {
-            socket.emit("error", { mensaje: "No encontré las clases indicadas para crear la relación" });
-          } else {
-            const tipoNormalizado = (resultado.tipo || "ASOCIACION").toUpperCase();
-            const multiplicidadOrigen = resultado.multiplicidadOrigen || "1..*";
-            const multiplicidadDestino = resultado.multiplicidadDestino || "1..*";
-            const relacion = await prisma.relacionUML.create({
-              data: {
-                tipo: tipoNormalizado,
-                multiplicidadOrigen,
-                multiplicidadDestino,
-                origenId: origen.id,
-                destinoId: destino.id,
-              },
-            });
-            await prisma.registroSesion.create({
-              data: {
-                usuarioId,
-                accion: `Creó relación ${origen.nombre} → ${destino.nombre}`,
-              },
-            });
-            io.to(`diagrama:${diagramaId}`).emit("relacion:creada", {
-              id: relacion.id,
-              origenId: relacion.origenId,
-              destinoId: relacion.destinoId,
-              tipo: relacion.tipo,
-              multiplicidadOrigen: relacion.multiplicidadOrigen,
-              multiplicidadDestino: relacion.multiplicidadDestino,
-            });
-            exito = true;
-          }
-        } else if (
-          resultado.accion === "cambiar_tipo_relacion" &&
-          resultado.origen &&
-          resultado.destino &&
-          resultado.tipo
-        ) {
-          const [origen, destino] = await Promise.all([
-            prisma.elementoDiagrama.findFirst({
-              where: { diagramaId, nombre: { equals: resultado.origen, mode: "insensitive" } },
-            }),
-            prisma.elementoDiagrama.findFirst({
-              where: { diagramaId, nombre: { equals: resultado.destino, mode: "insensitive" } },
-            }),
-          ]);
-
-          const relacion = origen && destino
-            ? await prisma.relacionUML.findFirst({
-                where: {
-                  OR: [
-                    { origenId: origen.id, destinoId: destino.id },
-                    { origenId: destino.id, destinoId: origen.id },
-                  ],
-                },
-              })
-            : null;
-
-          if (!relacion) {
-            socket.emit("error", {
-              mensaje: `No encontré una relación entre "${resultado.origen}" y "${resultado.destino}"`,
-            });
-          } else {
-            const actualizada = await prisma.relacionUML.update({
-              where: { id: relacion.id },
-              data: { tipo: resultado.tipo },
-              select: {
-                id: true,
-                tipo: true,
-                multiplicidadOrigen: true,
-                multiplicidadDestino: true,
-              },
-            });
-            await prisma.registroSesion.create({
-              data: {
-                usuarioId,
-                accion: `Cambió el tipo de relación ${relacion.id} a ${actualizada.tipo}`,
-              },
-            });
-            io.to(`diagrama:${diagramaId}`).emit("relacion:actualizada", {
-              relacionId: actualizada.id,
-              tipo: actualizada.tipo,
-              multiplicidadOrigen: actualizada.multiplicidadOrigen,
-              multiplicidadDestino: actualizada.multiplicidadDestino,
-            });
-            exito = true;
-          }
-        } else if (resultado.accion === "desconocido") {
-          socket.emit("error", { mensaje: "No entendí ese comando, intenta reformularlo" });
-        } else {
-          socket.emit("error", { mensaje: "No entendí ese comando, intenta reformularlo" });
-        }
-
-        if (resultado.accion === "error_conexion") {
-          socket.emit("error", { mensaje: "No se pudo conectar con el servicio de IA, intenta de nuevo en unos segundos" });
-        }
-          if (exito) {
-            exitosas++;
-          } else {
-            fallidas++;
-          }
-          } catch (err) {
-            fallidas++;
-            errores.push(`Error en "${resultado.accion}": ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
-
+        const resultadoAcciones = await ejecutarAccionesIA(diagramaId, usuarioId, acciones, socket);
+        exitosas = resultadoAcciones.exitosas;
+        fallidas = resultadoAcciones.fallidas;
+        errores.push(...resultadoAcciones.errores);
         socket.emit("comando:completado", { exitosas, fallidas, errores });
       } catch (err) {
         console.error("[Socket] Error en comando:interpretar:", err);
@@ -951,6 +1004,121 @@ export function configurarSocket(io: Server) {
         } catch (err) {
           console.error("[Socket] Error al guardar comando de voz:", err);
         }
+      }
+    });
+
+    socket.on("chat:enviar", async (payload: { diagramaId: string; contenido: string; invocarIA: boolean }) => {
+      try {
+        const usuarioId = socket.data.usuarioId as string | undefined;
+        const socketDiagramaId = socket.data.diagramaId as string | undefined;
+        const { diagramaId, contenido, invocarIA } = payload;
+
+        if (!usuarioId || !socketDiagramaId) {
+          socket.emit("error", { mensaje: "Debes unirte a un diagrama primero" });
+          return;
+        }
+        if (!diagramaId || socketDiagramaId !== diagramaId) {
+          socket.emit("error", { mensaje: "No tienes acceso a este diagrama" });
+          return;
+        }
+        if (typeof contenido !== "string" || !contenido.trim()) {
+          socket.emit("error", { mensaje: "El contenido del mensaje es requerido" });
+          return;
+        }
+
+        const mensaje = await prisma.mensajeChat.create({
+          data: { contenido: contenido.trim(), usuarioId, diagramaId },
+          include: { usuario: { select: { nombre: true } } },
+        });
+        io.to(`diagrama:${diagramaId}`).emit("chat:mensaje-nuevo", {
+          id: mensaje.id,
+          contenido: mensaje.contenido,
+          esIA: mensaje.esIA,
+          creadoEn: mensaje.creadoEn,
+          usuarioId: mensaje.usuarioId,
+          nombreUsuario: mensaje.usuario.nombre,
+          diagramaId: mensaje.diagramaId,
+        });
+
+        if (!invocarIA) return;
+
+        const [elementos, relaciones, historial, usuario] = await Promise.all([
+          prisma.elementoDiagrama.findMany({
+            where: { diagramaId },
+            select: {
+              id: true,
+              nombre: true,
+              tipo: true,
+              atributos: { select: { nombre: true, tipoDato: true, visibilidad: true } },
+            },
+          }),
+          prisma.relacionUML.findMany({
+            where: { origen: { diagramaId }, destino: { diagramaId } },
+            select: {
+              tipo: true,
+              multiplicidadOrigen: true,
+              multiplicidadDestino: true,
+              origen: { select: { nombre: true } },
+              destino: { select: { nombre: true } },
+            },
+          }),
+          prisma.mensajeChat.findMany({
+            where: { diagramaId, id: { not: mensaje.id } },
+            orderBy: { creadoEn: "desc" },
+            take: 10,
+            include: { usuario: { select: { nombre: true } } },
+          }),
+          prisma.usuario.findUnique({
+            where: { id: usuarioId },
+            select: { nombre: true },
+          }),
+        ]);
+
+        if (!usuario) throw new Error(`No se encontró el usuario ${usuarioId}`);
+
+        const contextoDiagrama = JSON.stringify({ clases: elementos, relaciones });
+        const historialChat = historial.reverse().map((item) => ({
+          autor: item.esIA ? "IA" : item.usuario.nombre,
+          mensaje: item.contenido,
+        }));
+        const respuesta = await generarRespuestaChat(
+          usuario.nombre,
+          mensaje.contenido,
+          contextoDiagrama,
+          historialChat
+        );
+        console.log("[DEBUG CHAT] Respuesta IA:", JSON.stringify({ mensaje: respuesta.mensaje, acciones: respuesta.acciones }));
+        const textoRespuesta = respuesta.mensaje;
+        const acciones = respuesta.acciones;
+        console.log("[DEBUG CHAT] Ejecutando acciones:", acciones.length);
+        const resultadoAcciones = acciones.length > 0
+          ? await ejecutarAccionesIA(diagramaId, usuarioId, acciones, socket)
+          : null;
+        const contenidoRespuesta = resultadoAcciones && resultadoAcciones.exitosas > 0
+          ? `${textoRespuesta}\n\n*(Se aplicaron ${resultadoAcciones.exitosas} cambios en el diagrama)*`
+          : textoRespuesta;
+        const mensajeIA = await prisma.mensajeChat.create({
+          data: {
+            contenido: contenidoRespuesta,
+            esIA: true,
+            usuarioId,
+            diagramaId,
+          },
+        });
+        io.to(`diagrama:${diagramaId}`).emit("chat:mensaje-nuevo", {
+          id: mensajeIA.id,
+          contenido: mensajeIA.contenido,
+          esIA: mensajeIA.esIA,
+          creadoEn: mensajeIA.creadoEn,
+          usuarioId: mensajeIA.usuarioId,
+          nombreUsuario: "IA",
+          diagramaId: mensajeIA.diagramaId,
+        });
+      } catch (error) {
+        console.error("[Socket] Error en chat:enviar:", error);
+        socket.emit("error", {
+          mensaje: "No se pudo procesar el mensaje del chat o la IA no está disponible.",
+        });
       }
     });
 

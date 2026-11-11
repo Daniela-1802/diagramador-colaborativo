@@ -17,6 +17,7 @@ model Usuario {
   colaboraciones Colaboracion[]
   registros      RegistroSesion[]
   comandos       ComandoVoz[]
+  mensajesChat   MensajeChat[]
 }
 
 model Diagrama {
@@ -27,6 +28,7 @@ model Diagrama {
   fechaModificacion DateTime         @updatedAt
   colaboraciones   Colaboracion[]
   elementos        ElementoDiagrama[]
+  mensajesChat     MensajeChat[]
 }
 
 enum TipoDiagrama {
@@ -101,4 +103,19 @@ model ComandoVoz {
   marcaTiempo       DateTime @default(now())
   usuario           Usuario  @relation(fields: [usuarioId], references: [id])
   usuarioId         String
+}
+
+model MensajeChat {
+  id          String   @id @default(uuid())
+  contenido   String
+  esIA        Boolean  @default(false)
+  creadoEn    DateTime @default(now())
+
+  usuarioId   String
+  usuario     Usuario  @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  diagramaId  String
+  diagrama    Diagrama @relation(fields: [diagramaId], references: [id], onDelete: Cascade)
+
+  @@map("MensajesChat")
 }
